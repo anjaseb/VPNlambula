@@ -1,1 +1,91 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // FlutterFire / Firebase
+    id "com.google.gms.google-services"
+    // Flutter plugin - MUST be last
+    id "dev.flutter.flutter-gradle-plugin"
+}
 
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0'
+}
+
+android {
+    namespace "com.luvita.lambula_vpn"
+    compileSdk 34
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        applicationId "com.luvita.lambula_vpn"
+        // Android 8.0+ (Oreo) — cobre quase 100% dos dispositivos activos
+        minSdk 26
+        targetSdk 34
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+
+        multiDexEnabled true
+    }
+
+    buildTypes {
+        release {
+            // Assina com a debug key durante o desenvolvimento.
+            // Em produção: substitua por uma keystore real.
+            signingConfig signingConfigs.debug
+
+            minifyEnabled false
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    // APK universal (arm + x86) — produz um único APK que roda em todos
+    splits {
+        abi {
+            enable false
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    // Firebase BoM — gere versões automaticamente
+    implementation platform('com.google.firebase:firebase-bom:33.6.0')
+    implementation 'com.google.firebase:firebase-messaging'
+    implementation 'com.google.firebase:firebase-analytics'
+
+    // MultiDex para minSdk < 21 (redundante aqui mas boa prática)
+    implementation 'androidx.multidex:multidex:2.0.1'
+}
