@@ -1,0 +1,87 @@
+name: Build Lambula VPN APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # Permite correr manualmente no GitHub
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout do código
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      # 2. Java 17 (necessário para Gradle moderno)
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # 3. Flutter SDK
+      - name: Configurar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+          cache: true
+
+      # 4. Injectar google-services.json (guardado como secret no GitHub)
+      - name: Adicionar google-services.json
+        run: |
+          echo "${{ secrets.GOOGLE_SERVICES_JSON }}" | base64 --decode > android/app/google-services.json
+
+      # 5. Instalar dependências Flutter
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # 6. Verificar código (opcional mas útil)
+      - name: Flutter analyze
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: true
+
+      # 7. Build APK release universal (funciona em todos Android 8+)
+      - name: Build APK Release
+        run: flutter build apk --release --no-shrink
+
+      # 8. Renomear APK com versão e data
+      - name: Renomear APK
+        run: |
+          DATE=$(date +'%Y%m%d')
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             build/app/outputs/flutter-apk/LambulaVPN-v1.0.0-${DATE}.apk
+
+      # 9. Upload do APK como artefacto (disponível para download no GitHub)
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LambulaVPN-APK
+          path: build/app/outputs/flutter-apk/LambulaVPN-*.apk
+          retention-days: 30
+
+      # 10. (Opcional) Criar Release automático quando fazes push de uma tag
+      - name: Criar GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/LambulaVPN-*.apk
+          name: "Lambula VPN ${{ github.ref_name }}"
+          body: |
+            ## Lambula VPN ${{ github.ref_name }}
+            by LuVita · Eng. Anthony
+            
+            ### Como instalar
+            1. Faz download do ficheiro `.apk`
+            2. No telemóvel: Definições → Segurança → Permitir fontes desconhecidas
+            3. Abre o ficheiro e instala
+            
+            Compatível com Android 8.0 (Oreo) e superior.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
