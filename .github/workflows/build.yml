@@ -3,6 +3,9 @@ name: Build Lambula VPN APK
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # Permite correr manualmente no GitHub
   workflow_dispatch:
 
 jobs:
@@ -11,38 +14,107 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout do código
       - name: Checkout repositório
         uses: actions/checkout@v4
 
+      # 2. Java 17 (necessário para Gradle moderno)
       - name: Configurar Java 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
+      # 3. Flutter SDK
       - name: Configurar Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.5'
+          flutter-version: '3.22.0'
           channel: 'stable'
           cache: true
 
+      # 4. Injectar google-services.json (guardado como secret no GitHub)
+      - name: Adicionar google-services.json
+        run: |
+          echo "${{ secrets.GOOGLE_SERVICES_JSON }}" | base64 --decode > android/app/google-services.json
+
+      # 5. Gerar ícones do app automaticamente (peixe Lambula)
+      - name: Gerar ícones Lambula
+        run: |
+          pip install pillow -q
+          python3 << 'PYEOF'
+          import os
+          from PIL import Image, ImageDraw
+
+          def draw_icon(size):
+              img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              d = ImageDraw.Draw(img)
+              m = int(size * 0.04)
+              # Fundo escuro
+              d.ellipse([m, m, size-m, size-m], fill=(2, 11, 24, 255))
+              # Anel exterior
+              d.ellipse([m, m, size-m, size-m], outline=(0, 212, 255, 80), width=max(1, size//40))
+              # Anel interior
+              m2 = int(size * 0.08)
+              d.ellipse([m2, m2, size-m2, size-m2], outline=(10, 79, 140, 150), width=max(1, size//60))
+              # Corpo do peixe
+              cx, cy = size * 0.52, size * 0.50
+              bw, bh = size * 0.38, size * 0.22
+              d.ellipse([cx-bw, cy-bh, cx+bw, cy+bh], fill=(13, 126, 194, 255))
+              # Cauda
+              tx = cx - bw
+              d.polygon([(tx, cy),(tx-size*0.12, cy-size*0.18),(tx-size*0.06, cy),(tx-size*0.12, cy+size*0.18)], fill=(10, 79, 140, 255))
+              # Barbatana dorsal
+              d.polygon([(cx-size*0.06, cy-bh),(cx+size*0.04, cy-bh-size*0.12),(cx+size*0.14, cy-bh+size*0.02)], fill=(26, 179, 240, 200))
+              # Olho
+              ex, ey, er = cx+bw*0.55, cy-bh*0.15, size*0.035
+              d.ellipse([ex-er, ey-er, ex+er, ey+er], fill=(234, 246, 255, 255))
+              pr = er * 0.5
+              d.ellipse([ex-pr, ey-pr, ex+pr, ey+pr], fill=(2, 11, 24, 255))
+              # Escamas
+              for i in range(3):
+                  sx = cx - bw*0.3 + i * bw*0.28
+                  d.arc([sx-bw*0.1, cy-bh*0.7, sx+bw*0.1, cy+bh*0.7], start=20, end=160, fill=(0, 212, 255, 60), width=max(1, size//80))
+              return img
+
+          sizes = {"mipmap-mdpi":48,"mipmap-hdpi":72,"mipmap-xhdpi":96,"mipmap-xxhdpi":144,"mipmap-xxxhdpi":192}
+          base = "android/app/src/main/res"
+          for folder, size in sizes.items():
+              os.makedirs(f"{base}/{folder}", exist_ok=True)
+              icon = draw_icon(size)
+              icon.save(f"{base}/{folder}/ic_launcher.png", "PNG")
+              # Round version
+              round_img = Image.new("RGBA", (size, size), (0,0,0,0))
+              mask = Image.new("L", (size, size), 0)
+              md = ImageDraw.Draw(mask)
+              md.ellipse([0,0,size,size], fill=255)
+              round_img.paste(icon, mask=mask)
+              round_img.save(f"{base}/{folder}/ic_launcher_round.png", "PNG")
+              print(f"✓ {folder}: {size}x{size}px")
+          print("Ícones gerados com sucesso!")
+          PYEOF
+
+      # 6. Instalar dependências Flutter
       - name: Flutter pub get
         run: flutter pub get
 
+      # 7. Verificar código (opcional mas útil)
       - name: Flutter analyze
         run: flutter analyze --no-fatal-infos
         continue-on-error: true
 
+      # 8. Build APK release universal (funciona em todos Android 8+)
       - name: Build APK Release
-        run: flutter build apk --release
+        run: flutter build apk --release --no-shrink
 
+      # 9. Renomear APK com versão e data
       - name: Renomear APK
         run: |
           DATE=$(date +'%Y%m%d')
           cp build/app/outputs/flutter-apk/app-release.apk \
              build/app/outputs/flutter-apk/LambulaVPN-v1.0.0-${DATE}.apk
 
+      # 10. Upload do APK como artefacto (disponível para download no GitHub)
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -50,6 +122,7 @@ jobs:
           path: build/app/outputs/flutter-apk/LambulaVPN-*.apk
           retention-days: 30
 
+      # 11. (Opcional) Criar Release automático quando fazes push de uma tag
       - name: Criar GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -59,6 +132,12 @@ jobs:
           body: |
             ## Lambula VPN ${{ github.ref_name }}
             by LuVita · Eng. Anthony
-            Compatível com Android 5.0+
+            
+            ### Como instalar
+            1. Faz download do ficheiro `.apk`
+            2. No telemóvel: Definições → Segurança → Permitir fontes desconhecidas
+            3. Abre o ficheiro e instala
+            
+            Compatível com Android 8.0 (Oreo) e superior.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
