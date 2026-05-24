@@ -7,80 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_messaging/firebase_messaging.dart';
-
-// ─────────────────────────────────────────────
-//  NOTIFICATION SERVICE
-// ─────────────────────────────────────────────
-final FlutterLocalNotificationsPlugin _localNotif =
-    FlutterLocalNotificationsPlugin();
-
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp();
-}
-
-Future<void> _initNotifications() async {
-  // Local notifications init
-  const androidSettings =
-      AndroidInitializationSettings('@mipmap/ic_launcher');
-  const initSettings = InitializationSettings(android: androidSettings);
-  await _localNotif.initialize(
-    initSettings,
-    onDidReceiveNotificationResponse: (details) {},
-  );
-
-  // FCM
-  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-
-  await FirebaseMessaging.instance
-      .requestPermission(alert: true, badge: true, sound: true);
-
-  // Foreground messages → show local notification
-  FirebaseMessaging.onMessage.listen((RemoteMessage msg) {
-    final notif = msg.notification;
-    if (notif != null) {
-      _showLocalNotification(
-        title: notif.title ?? 'Lambula VPN',
-        body: notif.body ?? '',
-      );
-    }
-  });
-}
-
-Future<void> _showLocalNotification({
-  required String title,
-  required String body,
-}) async {
-  const androidDetails = AndroidNotificationDetails(
-    'lambula_channel',
-    'Lambula VPN',
-    channelDescription: 'Notificações Lambula VPN',
-    importance: Importance.max,
-    priority: Priority.high,
-    showWhen: true,
-    styleInformation: BigTextStyleInformation(''),
-  );
-  const details = NotificationDetails(android: androidDetails);
-  await _localNotif.show(
-    DateTime.now().millisecondsSinceEpoch ~/ 1000,
-    title,
-    body,
-    details,
-  );
-}
 
 // ─────────────────────────────────────────────
 //  ENTRY POINT
 // ─────────────────────────────────────────────
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Firebase
-  await Firebase.initializeApp();
-  await _initNotifications();
-
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
