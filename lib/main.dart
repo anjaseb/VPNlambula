@@ -47,7 +47,7 @@ class AppColors {
 const String kConfigUrl =
     'https://raw.githubusercontent.com/SEU_USUARIO/lambula-vpn-config/main/config.json';
 
-const String kFacebookUrl = 'https://facebook.com/LuVitaAngola';
+const String kFacebookUrl = 'https://www.facebook.com/profile.php?id=61590528353950';
 
 // ─────────────────────────────────────────────
 //  MODELS
@@ -63,8 +63,12 @@ class VpnServer {
   final String password;
   final String protocol;
   final String? payload;
+  final String? sni;
+  final String? uuid;
   final int ping;
   final bool premium;
+  final bool active;
+  final String? expiry;
 
   VpnServer({
     required this.id,
@@ -77,8 +81,12 @@ class VpnServer {
     required this.password,
     required this.protocol,
     this.payload,
+    this.sni,
+    this.uuid,
     this.ping = 0,
     this.premium = false,
+    this.active = true,
+    this.expiry,
   });
 
   factory VpnServer.fromJson(Map<String, dynamic> j) => VpnServer(
@@ -92,8 +100,12 @@ class VpnServer {
         password: j['password'] ?? '',
         protocol: j['protocol'] ?? 'SSH',
         payload: j['payload'],
+        sni: j['sni'],
+        uuid: j['uuid'],
         ping: j['ping'] ?? 0,
         premium: j['premium'] ?? false,
+        active: j['active'] ?? true,
+        expiry: j['expiry'],
       );
 
   Map<String, dynamic> toJson() => {
@@ -107,8 +119,12 @@ class VpnServer {
         'password': password,
         'protocol': protocol,
         'payload': payload,
+        'sni': sni,
+        'uuid': uuid,
         'ping': ping,
         'premium': premium,
+        'active': active,
+        'expiry': expiry,
       };
 
   String get flagEmoji {
@@ -119,12 +135,46 @@ class VpnServer {
   }
 }
 
+class GlobalOptions {
+  final bool autoRetry;
+  final bool killSwitch;
+  final bool dnsLeakProtection;
+  final String dns1;
+  final String dns2;
+  final int keepalive;
+  final int timeout;
+  final int maxRetries;
+
+  GlobalOptions({
+    this.autoRetry = true,
+    this.killSwitch = false,
+    this.dnsLeakProtection = false,
+    this.dns1 = '1.1.1.1',
+    this.dns2 = '8.8.8.8',
+    this.keepalive = 30,
+    this.timeout = 15,
+    this.maxRetries = 3,
+  });
+
+  factory GlobalOptions.fromJson(Map<String, dynamic> j) => GlobalOptions(
+        autoRetry: j['autoRetry'] ?? true,
+        killSwitch: j['killSwitch'] ?? false,
+        dnsLeakProtection: j['dnsLeakProtection'] ?? false,
+        dns1: j['dns1'] ?? '1.1.1.1',
+        dns2: j['dns2'] ?? '8.8.8.8',
+        keepalive: j['keepalive'] ?? 30,
+        timeout: j['timeout'] ?? 15,
+        maxRetries: j['maxRetries'] ?? 3,
+      );
+}
+
 class AppConfig {
   final String appName;
   final String version;
   final String configUrl;
   final List<VpnServer> servers;
   final String announcement;
+  final GlobalOptions globalOptions;
 
   AppConfig({
     this.appName = 'Lambula VPN',
@@ -132,7 +182,8 @@ class AppConfig {
     this.configUrl = kConfigUrl,
     this.servers = const [],
     this.announcement = '',
-  });
+    GlobalOptions? globalOptions,
+  }) : globalOptions = globalOptions ?? GlobalOptions();
 
   factory AppConfig.fromJson(Map<String, dynamic> j) => AppConfig(
         appName: j['appName'] ?? 'Lambula VPN',
@@ -140,8 +191,12 @@ class AppConfig {
         configUrl: j['configUrl'] ?? kConfigUrl,
         servers: (j['servers'] as List<dynamic>? ?? [])
             .map((s) => VpnServer.fromJson(s as Map<String, dynamic>))
+            .where((s) => s.active)
             .toList(),
         announcement: j['announcement'] ?? '',
+        globalOptions: j['globalOptions'] != null
+            ? GlobalOptions.fromJson(j['globalOptions'] as Map<String, dynamic>)
+            : GlobalOptions(),
       );
 }
 
@@ -523,14 +578,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   ],
                 ),
               ),
-              const Text(
-                'by LuVita · Eng. Anthony',
-                style: TextStyle(
-                  fontSize: 10,
-                  color: AppColors.textSecondary,
-                  letterSpacing: 1,
-                ),
-              ),
+
             ],
           ),
           const Spacer(),
@@ -1619,9 +1667,9 @@ class AboutPanel extends StatelessWidget {
                       value: 'LuVita · Angola'),
                   const SizedBox(height: 14),
                   _AboutRow(
-                      icon: Icons.place_rounded,
-                      label: 'País',
-                      value: 'Angola'),
+                      icon: Icons.calendar_today_rounded,
+                      label: 'Lançamento',
+                      value: '12/05/2026'),
                 ],
               ),
             ),
@@ -1644,15 +1692,10 @@ class AboutPanel extends StatelessWidget {
                   ),
                   SizedBox(height: 10),
                   Text(
-                    'Lambula VPN é uma aplicação de tunelamento leve e segura, '
-                    'desenvolvida em Angola pela equipa LuVita. '
-                    'Concebida para oferecer privacidade e acesso livre à internet '
-                    'com o mínimo de consumo de recursos.\n\n'
-                    'O nome "Lambula" é uma homenagem ao peixe típico de Angola, '
-                    'símbolo da identidade e resistência do povo angolano.\n\n'
-                    'O app é administrado remotamente: servidores, configurações '
-                    'e mensagens são geridos pelo site de administração LuVita, '
-                    'garantindo actualizações sem necessidade de reinstalar o app.',
+                    'Lambula VPN oferece acesso livre e seguro à internet, '
+                    'protegendo a privacidade dos utilizadores através de '
+                    'tunelamento SSH. Leve, simples e sempre actualizada '
+                    'remotamente — sem necessidade de reinstalar o app.',
                     style: TextStyle(
                       color: AppColors.textSecondary,
                       fontSize: 13,
