@@ -45,7 +45,7 @@ class AppColors {
 
 // Substitua pela sua URL de configuração real
 const String kConfigUrl =
-    'https://raw.githubusercontent.com/SEU_USUARIO/lambula-vpn-config/main/config.json';
+    'https://raw.githubusercontent.com/anjaseb/VPNlambula/main/config.json';
 
 const String kFacebookUrl = 'https://www.facebook.com/profile.php?id=61590528353950';
 
@@ -1006,7 +1006,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       child: GestureDetector(
         onTap: () async {
           final uri = Uri.parse(kFacebookUrl);
-          if (await canLaunchUrl(uri)) launchUrl(uri);
+          if (await canLaunchUrl(uri)) {
+            launchUrl(uri, mode: LaunchMode.externalApplication);
+          }
         },
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1710,7 +1712,9 @@ class AboutPanel extends StatelessWidget {
           GestureDetector(
             onTap: () async {
               final uri = Uri.parse(kFacebookUrl);
-              if (await canLaunchUrl(uri)) launchUrl(uri);
+              if (await canLaunchUrl(uri)) {
+                launchUrl(uri, mode: LaunchMode.externalApplication);
+              }
             },
             child: _GlassCard(
               color: const Color(0xFF1877F2).withOpacity(0.15),
