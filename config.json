@@ -1,0 +1,17 @@
+{
+  "appName": "Lambula VPN",
+  "version": "1.0.0",
+  "announcement": "",
+  "globalOptions": {
+    "autoRetry": true,
+    "killSwitch": false,
+    "dnsLeakProtection": false,
+    "splitTunneling": false,
+    "dns1": "1.1.1.1",
+    "dns2": "8.8.8.8",
+    "keepalive": 30,
+    "timeout": 15,
+    "maxRetries": 3
+  },
+  "servers": []
+}
