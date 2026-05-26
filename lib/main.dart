@@ -340,7 +340,7 @@ class _HomeScreenState extends State<HomeScreen>
         location: args?['location'],
       );
     });
-    _addLog('🔒 VPN conectada · IP: ${_vpn.ip}');
+    _addLog(' VPN conectada · IP: ${_vpn.ip}');
     _startTimers();
   }
 
@@ -351,7 +351,7 @@ class _HomeScreenState extends State<HomeScreen>
     setState(() {
       _vpn = VpnState();
     });
-    _addLog('🔓 VPN desligada');
+    _addLog(' VPN desligada');
   }
 
   void _onVpnError(String msg) {
@@ -402,10 +402,10 @@ class _HomeScreenState extends State<HomeScreen>
 
     final s = _selectedServer!;
     _addLog('⚡ A conectar a ${s.name}...');
-    _addLog('🌐 Host: ${s.host}:${s.port}');
-    _addLog('🔧 Método: ${s.injectMethod}');
-    if (s.sni != null && s.sni!.isNotEmpty) _addLog('🔒 SNI: ${s.sni}');
-    if (s.resolvedPayload.isNotEmpty) _addLog('📦 Payload configurado');
+    _addLog(' Host: ${s.host}:${s.port}');
+    _addLog(' Método: ${s.injectMethod}');
+    if (s.sni != null && s.sni!.isNotEmpty) _addLog(' SNI: ${s.sni}');
+    if (s.resolvedPayload.isNotEmpty) _addLog(' Payload configurado');
 
     try {
       await _channel.invokeMethod('connect', {
@@ -589,7 +589,7 @@ class _HomeScreenState extends State<HomeScreen>
     ),
     child: Row(
       children: [
-        const Text('📢', style: TextStyle(fontSize: 14)),
+        const Text('', style: TextStyle(fontSize: 14)),
         const SizedBox(width: 10),
         Expanded(
           child: Text(_announcement!,
