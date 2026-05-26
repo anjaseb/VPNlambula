@@ -34,6 +34,27 @@
       "premium": false,
       "active": true,
       "expiry": "2026-05-28"
+    },
+    {
+      "id": "srv_1779835767939",
+      "name": "Portugal",
+      "country": "Portugal",
+      "countryCode": "PT",
+      "host": "H.facebook.com",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "protocol": "SSH",
+      "uuid": null,
+      "sni": "speedtest.unitel.co.ao",
+      "payload": "CONNECT [host]:[port] HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]X-Online-Host: [host][crlf][crlf]",
+      "injectMethod": "http-inject",
+      "socksPort": 1080,
+      "keepalive": 30,
+      "ping": 80,
+      "premium": false,
+      "active": true,
+      "expiry": "2026-05-29"
     }
   ]
 }
