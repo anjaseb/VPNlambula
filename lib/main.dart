@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -91,13 +92,11 @@ class ServerConfig {
   );
 
   String get flagEmoji {
-    if (countryCode.length != 2) return '🌐';
+    if (countryCode.length != 2) return '';
     final base = 0x1F1E6 - 0x41;
     return String.fromCharCode(base + countryCode.codeUnitAt(0)) +
         String.fromCharCode(base + countryCode.codeUnitAt(1));
   }
-
-  String get protocolBadge => protocol;
 
   String get resolvedPayload {
     if (payload == null || payload!.isEmpty) return '';
@@ -140,9 +139,9 @@ class AppConfig {
   );
 }
 
-// ─── VPN STATE ───────────────────────────────────
+// ─── VPN STATUS ──────────────────────────────────
 
-enum VpnStatus { disconnected, connecting, connected, error }
+enum VpnStatus { disconnected, connecting, connected, reconnecting, error }
 
 class VpnState {
   final VpnStatus status;
@@ -153,6 +152,7 @@ class VpnState {
   final Duration duration;
   final String? error;
   final List<String> logs;
+  final int retryCount;
 
   VpnState({
     this.status = VpnStatus.disconnected,
@@ -163,6 +163,7 @@ class VpnState {
     this.duration = Duration.zero,
     this.error,
     this.logs = const [],
+    this.retryCount = 0,
   });
 
   VpnState copyWith({
@@ -174,6 +175,7 @@ class VpnState {
     Duration? duration,
     String? error,
     List<String>? logs,
+    int? retryCount,
   }) => VpnState(
     status: status ?? this.status,
     ip: ip ?? this.ip,
@@ -183,6 +185,7 @@ class VpnState {
     duration: duration ?? this.duration,
     error: error ?? this.error,
     logs: logs ?? this.logs,
+    retryCount: retryCount ?? this.retryCount,
   );
 }
 
@@ -221,39 +224,37 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen>
-    with TickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
-  // State
   AppConfig? _config;
   ServerConfig? _selectedServer;
   VpnState _vpn = VpnState();
   bool _loadingConfig = true;
+  String? _configError;
   String? _announcement;
 
-  // Animações
+  // Reconexao
+  Timer? _reconnectTimer;
+  bool _userDisconnected = false;
+  static const int _maxRetries = 5;
+  static const List<int> _retryDelays = [5, 10, 20, 30, 60]; // segundos
+
   late AnimationController _pulseCtrl;
-  late AnimationController _rotateCtrl;
   late Animation<double> _pulseAnim;
 
-  // Timer
   Timer? _durationTimer;
-  Timer? _trafficTimer;
   DateTime? _connectedAt;
 
-  // Tab
   int _tab = 0;
 
   static const _configUrl =
-      'https://github.com/anjaseb/VPNlambula/blob/main/config.json';
+      'https://raw.githubusercontent.com/anjaseb/VPNlambula/main/config.json';
 
   @override
   void initState() {
     super.initState();
     _pulseCtrl = AnimationController(
       vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
-    _rotateCtrl = AnimationController(
-      vsync: this, duration: const Duration(seconds: 8))..repeat();
     _pulseAnim = Tween<double>(begin: 0.95, end: 1.05).animate(
       CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
     _loadConfig();
@@ -263,36 +264,66 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void dispose() {
     _pulseCtrl.dispose();
-    _rotateCtrl.dispose();
     _durationTimer?.cancel();
-    _trafficTimer?.cancel();
+    _reconnectTimer?.cancel();
     super.dispose();
   }
 
   // ── CONFIG ──────────────────────────────────────
 
   Future<void> _loadConfig() async {
-    setState(() => _loadingConfig = true);
+    setState(() {
+      _loadingConfig = true;
+      _configError = null;
+    });
     try {
       final prefs = await SharedPreferences.getInstance();
-      final url = prefs.getString('config_url') ?? _configUrl;
-      final r = await http.get(Uri.parse(url))
-          .timeout(const Duration(seconds: 10));
+      final baseUrl = prefs.getString('config_url') ?? _configUrl;
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final url = '$baseUrl?nocache=$ts';
+
+      final r = await http.get(Uri.parse(url), headers: {
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      }).timeout(const Duration(seconds: 15));
+
       if (r.statusCode == 200) {
-        final cfg = AppConfig.fromJson(jsonDecode(r.body));
+        late AppConfig cfg;
+        try {
+          cfg = AppConfig.fromJson(jsonDecode(r.body));
+        } catch (_) {
+          setState(() {
+            _loadingConfig = false;
+            _configError = 'Formato invalido no config.json';
+          });
+          return;
+        }
         setState(() {
           _config = cfg;
           _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
-          if (cfg.servers.isNotEmpty) _selectedServer = cfg.servers.first;
+          if (_selectedServer != null) {
+            final still = cfg.servers.any((s) => s.id == _selectedServer!.id);
+            if (!still) _selectedServer = cfg.servers.isNotEmpty ? cfg.servers.first : null;
+          } else if (cfg.servers.isNotEmpty) {
+            _selectedServer = cfg.servers.first;
+          }
           _loadingConfig = false;
         });
-        _addLog('✅ Config carregada — ${cfg.servers.length} servidores');
+        _addLog('[CONFIG] ${cfg.servers.length} servidor(es) carregado(s)');
       } else {
         throw Exception('HTTP ${r.statusCode}');
       }
+    } on TimeoutException {
+      setState(() {
+        _loadingConfig = false;
+        _configError = 'Tempo esgotado. Verifica a ligacao.';
+      });
     } catch (e) {
-      setState(() => _loadingConfig = false);
-      _addLog('⚠️ Erro ao carregar config: $e');
+      setState(() {
+        _loadingConfig = false;
+        _configError = 'Sem ligacao ao repositorio.';
+      });
     }
   }
 
@@ -329,43 +360,73 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _onConnected(Map? args) {
+    _reconnectTimer?.cancel();
     _connectedAt = DateTime.now();
     setState(() {
       _vpn = _vpn.copyWith(
         status: VpnStatus.connected,
-        ip: args?['ip'] ?? '—',
+        ip: args?['ip'] ?? '--',
         location: args?['location'],
+        retryCount: 0,
       );
     });
-    _addLog(' VPN conectada · IP: ${_vpn.ip}');
-    _startTimers();
+    _addLog('[VPN] Conectado. IP: ${_vpn.ip}');
+    _startDurationTimer();
   }
 
   void _onDisconnected() {
     _connectedAt = null;
     _durationTimer?.cancel();
-    _trafficTimer?.cancel();
-    setState(() {
-      _vpn = VpnState();
-    });
-    _addLog(' VPN desligada');
+    // Se o utilizador desligou manualmente, nao reconecta
+    if (_userDisconnected) {
+      setState(() { _vpn = VpnState(); });
+      _addLog('[VPN] Desligado pelo utilizador.');
+      return;
+    }
+    // Reconexao automatica
+    _scheduleReconnect();
   }
 
   void _onVpnError(String msg) {
-    setState(() {
-      _vpn = _vpn.copyWith(status: VpnStatus.error, error: msg);
-    });
-    _addLog('❌ Erro: $msg');
+    _addLog('[ERRO] $msg');
+    if (!_userDisconnected) {
+      _scheduleReconnect();
+    } else {
+      setState(() {
+        _vpn = _vpn.copyWith(status: VpnStatus.error, error: msg);
+      });
+    }
   }
 
-  void _startTimers() {
-    _durationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (_connectedAt != null) {
-        setState(() {
-          _vpn = _vpn.copyWith(
-            duration: DateTime.now().difference(_connectedAt!));
-        });
-      }
+  // ── RECONEXAO AUTOMATICA ─────────────────────────
+
+  void _scheduleReconnect() {
+    final retries = _vpn.retryCount;
+    if (retries >= _maxRetries) {
+      setState(() {
+        _vpn = _vpn.copyWith(
+          status: VpnStatus.error,
+          error: 'Falhou apos $_maxRetries tentativas.',
+        );
+      });
+      _addLog('[VPN] Maximo de tentativas atingido. Liga manualmente.');
+      return;
+    }
+
+    final delay = _retryDelays[retries.clamp(0, _retryDelays.length - 1)];
+    setState(() {
+      _vpn = _vpn.copyWith(
+        status: VpnStatus.reconnecting,
+        retryCount: retries + 1,
+      );
+    });
+    _addLog('[VPN] A reconectar em ${delay}s... (tentativa ${retries + 1}/$_maxRetries)');
+
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(seconds: delay), () {
+      if (!mounted || _userDisconnected) return;
+      _addLog('[VPN] A tentar reconectar...');
+      _connectServer(_selectedServer!);
     });
   }
 
@@ -373,9 +434,13 @@ class _HomeScreenState extends State<HomeScreen>
 
   Future<void> _toggleVpn() async {
     if (_vpn.status == VpnStatus.connected ||
-        _vpn.status == VpnStatus.connecting) {
+        _vpn.status == VpnStatus.connecting ||
+        _vpn.status == VpnStatus.reconnecting) {
+      _userDisconnected = true;
+      _reconnectTimer?.cancel();
       await _disconnect();
     } else {
+      _userDisconnected = false;
       await _connect();
     }
   }
@@ -385,25 +450,21 @@ class _HomeScreenState extends State<HomeScreen>
       _showSnack('Selecciona um servidor primeiro');
       return;
     }
-
-    // Pedir permissão VPN
     final perm = await _channel.invokeMethod('requestVpnPermission');
     if (perm != true) {
-      _showSnack('Permissão VPN negada');
+      _showSnack('Permissao VPN negada');
       return;
     }
-
     setState(() {
-      _vpn = _vpn.copyWith(status: VpnStatus.connecting);
+      _vpn = _vpn.copyWith(status: VpnStatus.connecting, retryCount: 0);
     });
+    await _connectServer(_selectedServer!);
+  }
 
-    final s = _selectedServer!;
-    _addLog('⚡ A conectar a ${s.name}...');
-    _addLog(' Host: ${s.host}:${s.port}');
-    _addLog(' Método: ${s.injectMethod}');
-    if (s.sni != null && s.sni!.isNotEmpty) _addLog(' SNI: ${s.sni}');
-    if (s.resolvedPayload.isNotEmpty) _addLog(' Payload configurado');
-
+  Future<void> _connectServer(ServerConfig s) async {
+    _addLog('[VPN] A conectar a ${s.name} (${s.host}:${s.port})');
+    _addLog('[VPN] Metodo: ${s.injectMethod}');
+    if (s.sni != null && s.sni!.isNotEmpty) _addLog('[VPN] SNI: ${s.sni}');
     try {
       await _channel.invokeMethod('connect', {
         'host': s.host,
@@ -431,21 +492,34 @@ class _HomeScreenState extends State<HomeScreen>
     try {
       await _channel.invokeMethod('disconnect');
     } catch (e) {
-      _onVpnError(e.toString());
+      setState(() { _vpn = VpnState(); });
     }
+  }
+
+  void _startDurationTimer() {
+    _durationTimer?.cancel();
+    _durationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_connectedAt != null && mounted) {
+        setState(() {
+          _vpn = _vpn.copyWith(
+            duration: DateTime.now().difference(_connectedAt!));
+        });
+      }
+    });
   }
 
   // ── HELPERS ─────────────────────────────────────
 
   void _addLog(String msg) {
-    final time = DateTime.now();
-    final ts = '${time.hour.toString().padLeft(2,'0')}:'
-        '${time.minute.toString().padLeft(2,'0')}:'
-        '${time.second.toString().padLeft(2,'0')}';
+    final t = DateTime.now();
+    final ts = '${t.hour.toString().padLeft(2,'0')}:'
+               '${t.minute.toString().padLeft(2,'0')}:'
+               '${t.second.toString().padLeft(2,'0')}';
+    if (!mounted) return;
     setState(() {
       final logs = List<String>.from(_vpn.logs);
       logs.insert(0, '[$ts] $msg');
-      if (logs.length > 100) logs.removeLast();
+      if (logs.length > 200) logs.removeLast();
       _vpn = _vpn.copyWith(logs: logs);
     });
   }
@@ -468,21 +542,27 @@ class _HomeScreenState extends State<HomeScreen>
 
   Color get _statusColor {
     switch (_vpn.status) {
-      case VpnStatus.connected: return const Color(0xFF00E5A0);
-      case VpnStatus.connecting: return const Color(0xFFFFB347);
-      case VpnStatus.error: return const Color(0xFFFF4D6D);
-      case VpnStatus.disconnected: return const Color(0xFF4A7A9B);
+      case VpnStatus.connected:     return const Color(0xFF00E5A0);
+      case VpnStatus.connecting:    return const Color(0xFFFFB347);
+      case VpnStatus.reconnecting:  return const Color(0xFFFFB347);
+      case VpnStatus.error:         return const Color(0xFFFF4D6D);
+      case VpnStatus.disconnected:  return const Color(0xFF4A7A9B);
     }
   }
 
   String get _statusText {
     switch (_vpn.status) {
-      case VpnStatus.connected: return 'LIGADO';
-      case VpnStatus.connecting: return 'A LIGAR...';
-      case VpnStatus.error: return 'ERRO';
+      case VpnStatus.connected:    return 'LIGADO';
+      case VpnStatus.connecting:   return 'A LIGAR...';
+      case VpnStatus.reconnecting: return 'A RECONECTAR...';
+      case VpnStatus.error:        return 'ERRO';
       case VpnStatus.disconnected: return 'DESLIGADO';
     }
   }
+
+  bool get _isBusy =>
+      _vpn.status == VpnStatus.connecting ||
+      _vpn.status == VpnStatus.reconnecting;
 
   // ─── BUILD ───────────────────────────────────────
 
@@ -517,21 +597,29 @@ class _HomeScreenState extends State<HomeScreen>
   Widget _buildTopBar() => Container(
     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
     decoration: BoxDecoration(
-      color: const Color(0xFF080E17).withOpacity(0.95),
-      border: Border(bottom: BorderSide(
-        color: Colors.white.withOpacity(0.07))),
+      color: const Color(0xFF080E17),
+      border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
     ),
     child: Row(
       children: [
         _buildLogo(),
         const Spacer(),
-        IconButton(
-          icon: const Icon(Icons.refresh, color: Color(0xFF4A7A9B), size: 20),
-          onPressed: _loadConfig,
-          tooltip: 'Actualizar servidores',
-        ),
+        _loadingConfig
+            ? const SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2, color: Color(0xFF00C8F0)))
+            : IconButton(
+                icon: const Icon(Icons.refresh, color: Color(0xFF4A7A9B), size: 20),
+                onPressed: _loadConfig,
+                tooltip: 'Actualizar',
+              ),
+        const SizedBox(width: 6),
         GestureDetector(
-          onTap: () => launchUrl(Uri.parse('https://facebook.com')),
+          onTap: () => launchUrl(
+            Uri.parse('https://facebook.com'),
+            mode: LaunchMode.externalApplication,
+          ),
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(
@@ -544,7 +632,8 @@ class _HomeScreenState extends State<HomeScreen>
                 Icon(Icons.facebook, color: Color(0xFF1877F2), size: 16),
                 SizedBox(width: 6),
                 Text('LuVita', style: TextStyle(
-                  color: Color(0xFF1877F2), fontSize: 12, fontWeight: FontWeight.w700)),
+                  color: Color(0xFF1877F2), fontSize: 12,
+                  fontWeight: FontWeight.w700)),
               ],
             ),
           ),
@@ -555,20 +644,17 @@ class _HomeScreenState extends State<HomeScreen>
 
   Widget _buildLogo() => Row(
     children: [
-      CustomPaint(
-        size: const Size(32, 32),
-        painter: _FishPainter(),
-      ),
+      CustomPaint(size: const Size(32, 32), painter: _FishPainter()),
       const SizedBox(width: 10),
       Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('LAMBULA VPN',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800,
-              letterSpacing: 2, color: Colors.white)),
-          Text('by LuVita',
-            style: TextStyle(fontSize: 10, color: Colors.white.withOpacity(0.4),
-              letterSpacing: 1)),
+          const Text('LAMBULA VPN', style: TextStyle(
+            fontSize: 13, fontWeight: FontWeight.w800,
+            letterSpacing: 2, color: Colors.white)),
+          Text('by LuVita', style: TextStyle(
+            fontSize: 10, color: Colors.white.withOpacity(0.4),
+            letterSpacing: 1)),
         ],
       ),
     ],
@@ -586,12 +672,8 @@ class _HomeScreenState extends State<HomeScreen>
     ),
     child: Row(
       children: [
-        const Text('', style: TextStyle(fontSize: 14)),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Text(_announcement!,
-            style: const TextStyle(fontSize: 12, color: Color(0xFF00C8F0))),
-        ),
+        Expanded(child: Text(_announcement!,
+          style: const TextStyle(fontSize: 12, color: Color(0xFF00C8F0)))),
         GestureDetector(
           onTap: () => setState(() => _announcement = null),
           child: Icon(Icons.close, size: 16,
@@ -608,16 +690,14 @@ class _HomeScreenState extends State<HomeScreen>
       color: const Color(0xFF0C1420),
       border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
     ),
-    child: Row(
-      children: [
-        _tab_(0, 'INÍCIO'),
-        _tab_(1, 'SERVIDORES'),
-        _tab_(2, 'LOGS'),
-      ],
-    ),
+    child: Row(children: [
+      _tabItem(0, 'INICIO'),
+      _tabItem(1, 'SERVIDORES'),
+      _tabItem(2, 'LOGS'),
+    ]),
   );
 
-  Widget _tab_(int i, String label) {
+  Widget _tabItem(int i, String label) {
     final active = _tab == i;
     return Expanded(
       child: GestureDetector(
@@ -633,9 +713,9 @@ class _HomeScreenState extends State<HomeScreen>
           child: Text(label,
             textAlign: TextAlign.center,
             style: TextStyle(
-              fontSize: 11, fontWeight: FontWeight.w700,
-              letterSpacing: 1.5,
-              color: active ? const Color(0xFF00C8F0)
+              fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 1.5,
+              color: active
+                  ? const Color(0xFF00C8F0)
                   : Colors.white.withOpacity(0.35),
             )),
         ),
@@ -656,19 +736,95 @@ class _HomeScreenState extends State<HomeScreen>
         _buildTrafficCard(),
         const SizedBox(height: 16),
         if (_selectedServer != null) _buildSelectedServerCard(),
+        if (_configError != null) ...[
+          const SizedBox(height: 16),
+          _buildErrorCard(),
+        ],
+        // Banner de reconexao
+        if (_vpn.status == VpnStatus.reconnecting) ...[
+          const SizedBox(height: 16),
+          _buildReconnectBanner(),
+        ],
+      ],
+    ),
+  );
+
+  Widget _buildReconnectBanner() => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: const Color(0xFFFFB347).withOpacity(0.08),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: const Color(0xFFFFB347).withOpacity(0.25)),
+    ),
+    child: Row(
+      children: [
+        const SizedBox(
+          width: 16, height: 16,
+          child: CircularProgressIndicator(
+            strokeWidth: 2, color: Color(0xFFFFB347))),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            'Tentativa ${_vpn.retryCount}/$_maxRetries — A reconectar automaticamente...',
+            style: const TextStyle(
+              color: Color(0xFFFFB347), fontSize: 12)),
+        ),
+        GestureDetector(
+          onTap: () {
+            _userDisconnected = true;
+            _reconnectTimer?.cancel();
+            setState(() { _vpn = VpnState(); });
+          },
+          child: const Text('CANCELAR',
+            style: TextStyle(
+              color: Color(0xFFFF4D6D), fontSize: 11,
+              fontWeight: FontWeight.w700)),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildErrorCard() => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: const Color(0xFFFF4D6D).withOpacity(0.08),
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: const Color(0xFFFF4D6D).withOpacity(0.2)),
+    ),
+    child: Column(
+      children: [
+        Text(_configError!,
+          style: const TextStyle(color: Color(0xFFFF4D6D), fontSize: 12),
+          textAlign: TextAlign.center),
+        const SizedBox(height: 10),
+        GestureDetector(
+          onTap: _loadConfig,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFF4D6D).withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFFF4D6D).withOpacity(0.3)),
+            ),
+            child: const Text('TENTAR NOVAMENTE',
+              style: TextStyle(color: Color(0xFFFF4D6D),
+                fontSize: 11, fontWeight: FontWeight.w700)),
+          ),
+        ),
       ],
     ),
   );
 
   Widget _buildConnectButton() {
     final isConnected = _vpn.status == VpnStatus.connected;
-    final isConnecting = _vpn.status == VpnStatus.connecting;
     return GestureDetector(
       onTap: _toggleVpn,
       child: AnimatedBuilder(
         animation: _pulseAnim,
         builder: (_, __) => Transform.scale(
-          scale: isConnecting ? _pulseAnim.value : 1.0,
+          scale: _isBusy ? _pulseAnim.value : 1.0,
           child: Container(
             width: 160, height: 160,
             decoration: BoxDecoration(
@@ -680,21 +836,34 @@ class _HomeScreenState extends State<HomeScreen>
                   blurRadius: 30, spreadRadius: 5),
               ],
             ),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  isConnected ? Icons.lock : Icons.lock_open,
-                  color: _statusColor, size: 48,
-                ),
-                const SizedBox(height: 8),
-                Text(_statusText,
-                  style: TextStyle(
-                    color: _statusColor, fontSize: 11,
-                    fontWeight: FontWeight.w800, letterSpacing: 2,
-                  )),
-              ],
-            ),
+            child: _isBusy
+                ? Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 40, height: 40,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3, color: _statusColor)),
+                      const SizedBox(height: 10),
+                      Text(_statusText,
+                        style: TextStyle(
+                          color: _statusColor, fontSize: 10,
+                          fontWeight: FontWeight.w800, letterSpacing: 1.5)),
+                    ],
+                  )
+                : Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        isConnected ? Icons.lock : Icons.lock_open,
+                        color: _statusColor, size: 48),
+                      const SizedBox(height: 8),
+                      Text(_statusText,
+                        style: TextStyle(
+                          color: _statusColor, fontSize: 11,
+                          fontWeight: FontWeight.w800, letterSpacing: 2)),
+                    ],
+                  ),
           ),
         ),
       ),
@@ -702,91 +871,63 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildStatusCard() => _card(
-    child: Row(
-      children: [
-        _statItem('IP', _vpn.ip ?? '—', const Color(0xFF00C8F0)),
-        _divider(),
-        _statItem('TEMPO',
-          _formatDuration(_vpn.duration), const Color(0xFF00E5A0)),
-        _divider(),
-        _statItem('ESTADO', _statusText, _statusColor),
-      ],
-    ),
+    child: Row(children: [
+      _statItem('IP', _vpn.ip ?? '--', const Color(0xFF00C8F0)),
+      _divider(),
+      _statItem('TEMPO', _formatDuration(_vpn.duration), const Color(0xFF00E5A0)),
+      _divider(),
+      _statItem('ESTADO', _statusText, _statusColor),
+    ]),
   );
 
   Widget _buildTrafficCard() => _card(
-    child: Row(
-      children: [
-        _statItem('↑ ENVIADO',
-          _formatBytes(_vpn.bytesSent), const Color(0xFFFFB347)),
-        _divider(),
-        _statItem('↓ RECEBIDO',
-          _formatBytes(_vpn.bytesReceived), const Color(0xFF00E5A0)),
-      ],
-    ),
+    child: Row(children: [
+      _statItem('ENVIADO', _formatBytes(_vpn.bytesSent), const Color(0xFFFFB347)),
+      _divider(),
+      _statItem('RECEBIDO', _formatBytes(_vpn.bytesReceived), const Color(0xFF00E5A0)),
+    ]),
   );
 
   Widget _buildSelectedServerCard() {
     final s = _selectedServer!;
     return _card(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Row(
-            children: [
-              Text(s.flagEmoji, style: const TextStyle(fontSize: 20)),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(s.name,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700, fontSize: 14)),
-                    Text('${s.host}:${s.port}',
-                      style: TextStyle(fontSize: 11,
-                        color: Colors.white.withOpacity(0.4),
-                        fontFamily: 'monospace')),
-                  ],
-                ),
-              ),
-              _badge(s.protocol, const Color(0xFF00C8F0)),
-              const SizedBox(width: 6),
-              if (s.premium) _badge('PRO', const Color(0xFFFFB347)),
-            ],
+          // Bandeira sem texto adicional
+          Text(s.flagEmoji, style: const TextStyle(fontSize: 28)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(s.name,
+              style: const TextStyle(
+                fontWeight: FontWeight.w700, fontSize: 15)),
           ),
-          if (s.injectMethod != 'none') ...[
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                _badge('💉 ${s.injectMethod}', const Color(0xFF00E5A0)),
-                if (s.sni != null && s.sni!.isNotEmpty) ...[
-                  const SizedBox(width: 6),
-                  _badge('🔒 ${s.sni}', const Color(0xFFFFB347)),
-                ],
-              ],
-            ),
-          ],
-          const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: GestureDetector(
-              onTap: () => setState(() => _tab = 1),
-              child: Container(
-                padding: const EdgeInsets.symmetric(vertical: 10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF00C8F0).withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: const Color(0xFF00C8F0).withOpacity(0.2)),
-                ),
-                child: const Text('TROCAR SERVIDOR',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Color(0xFF00C8F0), fontSize: 11,
-                    fontWeight: FontWeight.w700, letterSpacing: 1.5,
-                  )),
+          if (s.premium)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFB347).withOpacity(0.12),
+                borderRadius: BorderRadius.circular(5),
+                border: Border.all(color: const Color(0xFFFFB347).withOpacity(0.3)),
               ),
+              child: const Text('PRO',
+                style: TextStyle(
+                  color: Color(0xFFFFB347), fontSize: 10,
+                  fontWeight: FontWeight.w800)),
+            ),
+          const SizedBox(width: 10),
+          GestureDetector(
+            onTap: () => setState(() => _tab = 1),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00C8F0).withOpacity(0.08),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.2)),
+              ),
+              child: const Text('TROCAR',
+                style: TextStyle(
+                  color: Color(0xFF00C8F0), fontSize: 11,
+                  fontWeight: FontWeight.w700)),
             ),
           ),
         ],
@@ -799,31 +940,78 @@ class _HomeScreenState extends State<HomeScreen>
   Widget _buildServersTab() {
     if (_loadingConfig) {
       return const Center(
-        child: CircularProgressIndicator(color: Color(0xFF00C8F0)));
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(color: Color(0xFF00C8F0)),
+            SizedBox(height: 16),
+            Text('A carregar servidores...',
+              style: TextStyle(color: Color(0xFF4A7A9B), fontSize: 12)),
+          ],
+        ),
+      );
     }
+
+    if (_configError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.cloud_off,
+                color: Colors.white.withOpacity(0.15), size: 48),
+              const SizedBox(height: 16),
+              Text(_configError!,
+                style: TextStyle(color: Colors.white.withOpacity(0.4),
+                  fontSize: 13),
+                textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              GestureDetector(
+                onTap: _loadConfig,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00C8F0).withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.3)),
+                  ),
+                  child: const Text('TENTAR NOVAMENTE',
+                    style: TextStyle(
+                      color: Color(0xFF00C8F0), fontSize: 12,
+                      fontWeight: FontWeight.w700)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_config == null || _config!.servers.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.cloud_off,
-              color: Colors.white.withOpacity(0.2), size: 48),
+            Icon(Icons.dns_outlined, color: Colors.white.withOpacity(0.15), size: 48),
             const SizedBox(height: 16),
-            Text('Sem servidores disponíveis',
+            Text('Sem servidores disponiveis',
               style: TextStyle(color: Colors.white.withOpacity(0.4))),
-            const SizedBox(height: 12),
+            const SizedBox(height: 6),
+            Text('Adiciona servidores no painel admin',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.2), fontSize: 11)),
+            const SizedBox(height: 16),
             GestureDetector(
               onTap: _loadConfig,
               child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 20, vertical: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                 decoration: BoxDecoration(
                   color: const Color(0xFF00C8F0).withOpacity(0.1),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: const Color(0xFF00C8F0).withOpacity(0.3)),
+                  border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.3)),
                 ),
-                child: const Text('TENTAR NOVAMENTE',
+                child: const Text('ACTUALIZAR',
                   style: TextStyle(
                     color: Color(0xFF00C8F0), fontSize: 12,
                     fontWeight: FontWeight.w700)),
@@ -842,17 +1030,19 @@ class _HomeScreenState extends State<HomeScreen>
         final selected = _selectedServer?.id == s.id;
         return GestureDetector(
           onTap: () {
-            setState(() => _selectedServer = s);
-            _showSnack('${s.name} seleccionado');
-            Future.delayed(const Duration(milliseconds: 300), () {
-              setState(() => _tab = 0);
+            setState(() {
+              _selectedServer = s;
+              _tab = 0;
             });
+            _showSnack('${s.name} seleccionado');
           },
           child: Container(
             margin: const EdgeInsets.only(bottom: 10),
-            padding: const EdgeInsets.all(14),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
-              color: const Color(0xFF0C1420),
+              color: selected
+                  ? const Color(0xFF00C8F0).withOpacity(0.06)
+                  : const Color(0xFF0C1420),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
                 color: selected
@@ -863,40 +1053,37 @@ class _HomeScreenState extends State<HomeScreen>
             ),
             child: Row(
               children: [
+                // Apenas bandeira e nome — sem mais nada
                 Text(s.flagEmoji,
-                  style: const TextStyle(fontSize: 24)),
-                const SizedBox(width: 12),
+                  style: const TextStyle(fontSize: 26)),
+                const SizedBox(width: 14),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(s.name,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w700, fontSize: 14)),
-                      const SizedBox(height: 4),
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 4,
-                        children: [
-                          Text('${s.host}:${s.port}',
-                            style: TextStyle(fontSize: 10,
-                              color: Colors.white.withOpacity(0.35),
-                              fontFamily: 'monospace')),
-                          _badge(s.protocol, const Color(0xFF00C8F0)),
-                          if (s.injectMethod != 'none')
-                            _badge(s.injectMethod, const Color(0xFF00E5A0)),
-                          if (s.premium)
-                            _badge('PRO', const Color(0xFFFFB347)),
-                          if (s.ping > 0)
-                            _badge('${s.ping}ms', Colors.white.withOpacity(0.4)),
-                        ],
-                      ),
-                    ],
-                  ),
+                  child: Text(s.name,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w700, fontSize: 15,
+                      color: Colors.white)),
                 ),
-                if (selected)
-                  const Icon(Icons.check_circle,
-                    color: Color(0xFF00C8F0), size: 20),
+                if (s.premium)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFB347).withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: const Color(0xFFFFB347).withOpacity(0.25)),
+                    ),
+                    child: const Text('PRO',
+                      style: TextStyle(
+                        fontSize: 9, fontWeight: FontWeight.w800,
+                        color: Color(0xFFFFB347))),
+                  ),
+                const SizedBox(width: 8),
+                Icon(
+                  selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                  color: selected
+                      ? const Color(0xFF00C8F0)
+                      : Colors.white.withOpacity(0.2),
+                  size: 20),
               ],
             ),
           ),
@@ -913,27 +1100,27 @@ class _HomeScreenState extends State<HomeScreen>
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         child: Row(
           children: [
-            Text('LOGS DE CONEXÃO',
-              style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
-                letterSpacing: 2, color: Colors.white.withOpacity(0.4),
-                fontFamily: 'monospace')),
+            Text('LOGS DE CONEXAO',
+              style: TextStyle(
+                fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 2,
+                color: Colors.white.withOpacity(0.4), fontFamily: 'monospace')),
             const Spacer(),
             GestureDetector(
               onTap: () => setState(() {
                 _vpn = _vpn.copyWith(logs: []);
               }),
-              child: Text('LIMPAR',
-                style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
-                  letterSpacing: 1.5, color: const Color(0xFF00C8F0))),
+              child: const Text('LIMPAR',
+                style: TextStyle(
+                  fontSize: 10, fontWeight: FontWeight.w700,
+                  letterSpacing: 1.5, color: Color(0xFF00C8F0))),
             ),
           ],
         ),
       ),
       Expanded(
         child: _vpn.logs.isEmpty
-            ? Center(
-                child: Text('Sem logs',
-                  style: TextStyle(color: Colors.white.withOpacity(0.2))))
+            ? Center(child: Text('Sem logs',
+                style: TextStyle(color: Colors.white.withOpacity(0.2))))
             : ListView.builder(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 itemCount: _vpn.logs.length,
@@ -942,8 +1129,7 @@ class _HomeScreenState extends State<HomeScreen>
                   child: Text(_vpn.logs[i],
                     style: const TextStyle(
                       fontSize: 11, fontFamily: 'monospace',
-                      color: Color(0xFF00E5A0), height: 1.5,
-                    )),
+                      color: Color(0xFF00E5A0), height: 1.5)),
                 ),
               ),
       ),
@@ -966,13 +1152,13 @@ class _HomeScreenState extends State<HomeScreen>
   Widget _statItem(String label, String value, Color color) => Expanded(
     child: Column(
       children: [
-        Text(label,
-          style: TextStyle(fontSize: 9, letterSpacing: 1.5,
-            color: Colors.white.withOpacity(0.35),
-            fontFamily: 'monospace')),
+        Text(label, style: TextStyle(
+          fontSize: 9, letterSpacing: 1.5,
+          color: Colors.white.withOpacity(0.35), fontFamily: 'monospace')),
         const SizedBox(height: 4),
         Text(value,
-          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800,
+          style: TextStyle(
+            fontSize: 13, fontWeight: FontWeight.w800,
             color: color, fontFamily: 'monospace'),
           overflow: TextOverflow.ellipsis),
       ],
@@ -980,21 +1166,7 @@ class _HomeScreenState extends State<HomeScreen>
   );
 
   Widget _divider() => Container(
-    width: 1, height: 32,
-    color: Colors.white.withOpacity(0.07),
-  );
-
-  Widget _badge(String label, Color color) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-    decoration: BoxDecoration(
-      color: color.withOpacity(0.1),
-      borderRadius: BorderRadius.circular(4),
-      border: Border.all(color: color.withOpacity(0.25)),
-    ),
-    child: Text(label,
-      style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700,
-        color: color, letterSpacing: 0.5, fontFamily: 'monospace')),
-  );
+    width: 1, height: 32, color: Colors.white.withOpacity(0.07));
 }
 
 // ─── FISH PAINTER ────────────────────────────────
@@ -1005,21 +1177,15 @@ class _FishPainter extends CustomPainter {
     final cx = size.width * 0.52;
     final cy = size.height * 0.50;
 
-    // Fundo
     canvas.drawCircle(
-      Offset(size.width / 2, size.height / 2),
-      size.width / 2,
-      Paint()..color = const Color(0xFF020B18),
-    );
+      Offset(size.width / 2, size.height / 2), size.width / 2,
+      Paint()..color = const Color(0xFF020B18));
 
-    // Corpo
     canvas.drawOval(
       Rect.fromCenter(center: Offset(cx, cy),
         width: size.width * 0.76, height: size.height * 0.44),
-      Paint()..color = const Color(0xFF0D7EC2),
-    );
+      Paint()..color = const Color(0xFF0D7EC2));
 
-    // Cauda
     final tail = Path()
       ..moveTo(cx - size.width * 0.38, cy)
       ..lineTo(cx - size.width * 0.60, cy - size.height * 0.20)
@@ -1028,17 +1194,12 @@ class _FishPainter extends CustomPainter {
       ..close();
     canvas.drawPath(tail, Paint()..color = const Color(0xFF0A4F8C));
 
-    // Olho
     canvas.drawCircle(
       Offset(cx + size.width * 0.24, cy - size.height * 0.06),
-      size.width * 0.08,
-      Paint()..color = const Color(0xFFEAF6FF),
-    );
+      size.width * 0.08, Paint()..color = const Color(0xFFEAF6FF));
     canvas.drawCircle(
       Offset(cx + size.width * 0.24, cy - size.height * 0.06),
-      size.width * 0.04,
-      Paint()..color = const Color(0xFF020B18),
-    );
+      size.width * 0.04, Paint()..color = const Color(0xFF020B18));
   }
 
   @override
