@@ -13,5 +13,27 @@
     "timeout": 15,
     "maxRetries": 3
   },
-  "servers": []
+  "servers": [
+    {
+      "id": "srv_1779757533144",
+      "name": "Angola",
+      "country": "Angola",
+      "countryCode": "AO",
+      "host": "A.a.g",
+      "port": 22,
+      "username": "E",
+      "password": "eeeee",
+      "protocol": "SSH",
+      "uuid": null,
+      "sni": "Dddd.com",
+      "payload": null,
+      "injectMethod": "websocket",
+      "socksPort": 1080,
+      "keepalive": 30,
+      "ping": 80,
+      "premium": false,
+      "active": true,
+      "expiry": null
+    }
+  ]
 }
