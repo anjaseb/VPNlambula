@@ -1,4 +1,4 @@
-name: Build Lambula VPN APK
+name: Build Lambula VPN AP
 
 on:
   push:
