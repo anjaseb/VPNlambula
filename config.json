@@ -1,7 +1,7 @@
 {
   "appName": "Lambula VPN",
   "version": "1.0.0",
-  "announcement": "Bom dia, sejam todos bem vindos a lambulaVPN!",
+  "announcement": "",
   "globalOptions": {
     "autoRetry": true,
     "killSwitch": false,
@@ -13,27 +13,5 @@
     "timeout": 15,
     "maxRetries": 3
   },
-  "servers": [
-    {
-      "id": "srv_1779812314108",
-      "name": "Angola",
-      "country": "Angola",
-      "countryCode": "AO",
-      "host": "h.facebook.com",
-      "port": 8080,
-      "username": "",
-      "password": "",
-      "protocol": "SSH",
-      "uuid": null,
-      "sni": "h.facebook.com",
-      "payload": "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]X-Forward-Host: movicel.co.ao[crlf][crlf]",
-      "injectMethod": "websocket",
-      "socksPort": 1080,
-      "keepalive": 30,
-      "ping": 80,
-      "premium": false,
-      "active": true,
-      "expiry": null
-    }
-  ]
+  "servers": []
 }
