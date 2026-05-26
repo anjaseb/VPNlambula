@@ -1,39 +1,17 @@
 {
   "appName": "Lambula VPN",
   "version": "1.0.0",
-  "announcement": "",
+  "announcement": "Bom dia",
   "globalOptions": {
     "autoRetry": true,
     "killSwitch": false,
-    "dnsLeakProtection": false,
-    "splitTunneling": false,
+    "dnsLeakProtection": true,
+    "splitTunneling": true,
     "dns1": "1.1.1.1",
     "dns2": "8.8.8.8",
     "keepalive": 30,
     "timeout": 15,
     "maxRetries": 3
   },
-  "servers": [
-    {
-      "id": "srv_1779757533144",
-      "name": "Angola",
-      "country": "Angola",
-      "countryCode": "AO",
-      "host": "A.a.g",
-      "port": 22,
-      "username": "E",
-      "password": "eeeee",
-      "protocol": "SSH",
-      "uuid": null,
-      "sni": "Dddd.com",
-      "payload": null,
-      "injectMethod": "websocket",
-      "socksPort": 1080,
-      "keepalive": 30,
-      "ping": 80,
-      "premium": false,
-      "active": true,
-      "expiry": null
-    }
-  ]
+  "servers": []
 }
