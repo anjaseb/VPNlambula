@@ -13,5 +13,27 @@
     "timeout": 15,
     "maxRetries": 3
   },
-  "servers": []
+  "servers": [
+    {
+      "id": "srv_1779833300443",
+      "name": "Angola",
+      "country": "Angola",
+      "countryCode": "AO",
+      "host": "h.facebook.com",
+      "port": 22,
+      "username": "root",
+      "password": "",
+      "protocol": "SSH",
+      "uuid": null,
+      "sni": null,
+      "payload": null,
+      "injectMethod": "http-connect",
+      "socksPort": 1080,
+      "keepalive": 30,
+      "ping": 80,
+      "premium": false,
+      "active": true,
+      "expiry": "2026-05-28"
+    }
+  ]
 }
