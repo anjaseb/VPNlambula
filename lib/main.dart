@@ -245,7 +245,7 @@ class _HomeScreenState extends State<HomeScreen>
   int _tab = 0;
 
   static const _configUrl =
-      'https://raw.githubusercontent.com/anjaseb/VPNlambula/main/config.json';
+      'https://github.com/anjaseb/VPNlambula/blob/main/config.json';
 
   @override
   void initState() {
