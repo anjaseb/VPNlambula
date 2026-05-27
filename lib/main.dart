@@ -348,7 +348,10 @@ class SshTunnelManager {
     if (server.resolvedPayload.contains(':443')) return 443;
     if (server.resolvedPayload.contains(':8080')) return 8080;
     if (server.port != 22) return server.port;
-    return 80;
+    return server.port;
+    
+    
+    
   }
 
   Future<void> _startSocksProxy(
