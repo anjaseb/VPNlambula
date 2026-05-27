@@ -800,7 +800,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
     decoration: BoxDecoration(
       color: const Color(0xFF080E17),
-      border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
+      border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha:0.08))),
     ),
     child: Row(
       children: [
