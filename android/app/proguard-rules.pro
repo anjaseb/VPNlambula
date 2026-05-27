@@ -9,13 +9,20 @@
 -keep class kotlin.** { *; }
 -keepclassmembers class kotlin.Metadata { *; }
 
-# Manter nomes de classes nativas
+# Atributos
 -keepattributes *Annotation*
 -keepattributes SourceFile,LineNumberTable
 -keepattributes Signature
 -keepattributes Exceptions
 
-# http / okhttp (usado pelo Flutter internamente)
+# HTTP / OkHttp
 -dontwarn okhttp3.**
 -dontwarn okio.**
 -dontwarn javax.annotation.**
+
+# ← ADICIONAR ISTO — Google Play Core (referenciado pelo Flutter mas não usado)
+-dontwarn com.google.android.play.core.**
+-keep class com.google.android.play.core.** { *; }
+-dontwarn com.google.android.play.core.splitcompat.**
+-dontwarn com.google.android.play.core.splitinstall.**
+-dontwarn com.google.android.play.core.tasks.**
