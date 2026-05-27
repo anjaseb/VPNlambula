@@ -377,48 +377,43 @@ Future<void> _handleSocksClient(
   client.add([0x05, 0x00]);
 
   final req = await stream.first.timeout(const Duration(seconds: 5));
-    if (data[0] != 0x05) { client.destroy(); return; }
-    client.add([0x05, 0x00]);
-
-    final req = await client.first.timeout(const Duration(seconds: 5));
-    if (req[1] != 0x01) {
-      client.add([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]);
-      client.destroy(); return;
-    }
-
-    String targetHost;
-    int offset;
-    switch (req[3]) {
-      case 0x01:
-        targetHost = '${req[4]}.${req[5]}.${req[6]}.${req[7]}';
-        offset = 8; break;
-      case 0x03:
-        final len = req[4];
-        targetHost = String.fromCharCodes(req.sublist(5, 5 + len));
-        offset = 5 + len; break;
-      case 0x04:
-        targetHost = req.sublist(4, 20)
-            .map((b) => b.toRadixString(16).padLeft(2,'0'))
-            .join(':');
-        offset = 20; break;
-      default:
-        client.destroy(); return;
-    }
-
-    final targetPort = (req[offset] << 8) | req[offset + 1];
-    client.add([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]);
-    onLog('[PROXY] -> $targetHost:$targetPort');
-
-    try {
-      final forward = await _client!.forwardLocal(targetHost, targetPort);
-      unawaited(forward.stream.cast<List<int>>().pipe(client));
-      unawaited(client.cast<List<int>>().pipe(forward.sink));
-    } catch (e) {
-      onLog('[PROXY] Forward falhou: $e');
-      client.destroy();
-    }
+  if (req[1] != 0x01) {
+    client.add([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]);
+    client.destroy(); return;
   }
 
+  String targetHost;
+  int offset;
+  switch (req[3]) {
+    case 0x01:
+      targetHost = '${req[4]}.${req[5]}.${req[6]}.${req[7]}';
+      offset = 8; break;
+    case 0x03:
+      final len = req[4];
+      targetHost = String.fromCharCodes(req.sublist(5, 5 + len));
+      offset = 5 + len; break;
+    case 0x04:
+      targetHost = req.sublist(4, 20)
+          .map((b) => b.toRadixString(16).padLeft(2,'0'))
+          .join(':');
+      offset = 20; break;
+    default:
+      client.destroy(); return;
+  }
+
+  final targetPort = (req[offset] << 8) | req[offset + 1];
+  client.add([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]);
+  onLog('[PROXY] -> $targetHost:$targetPort');
+
+  try {
+    final forward = await _client!.forwardLocal(targetHost, targetPort);
+    unawaited(forward.stream.cast<List<int>>().pipe(client));
+    unawaited(client.cast<List<int>>().pipe(forward.sink));
+  } catch (e) {
+    onLog('[PROXY] Forward falhou: $e');
+    client.destroy();
+  }
+}
   Future<void> disconnect() async {
     running = false;
     try { await _socksServer?.close(); } catch (_) {}
