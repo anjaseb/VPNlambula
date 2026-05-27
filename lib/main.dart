@@ -1052,8 +1052,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       border: Border.all(color: const Color(0xFFFF4D6D).withOpacity(0.2)),
     ),
     child: Column(children: [
-      Text(_configError!, style: const TextStyle(
-          color: Color(0xFFFF4D6D), fontSize: 12),
+Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(color: Color(0xFFFF4D6D), fontSize: 12),
           textAlign: TextAlign.center),
       const SizedBox(height: 10),
       GestureDetector(
