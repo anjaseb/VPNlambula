@@ -225,7 +225,7 @@ class SshTunnelManager {
     _client = SSHClient(
       socket,
       username: server.username,
-      onPasswordRequest: () => server.password,,
+      onPasswordRequest: () => server.password,
       keepAliveInterval: Duration(seconds: server.keepalive),
     );
 
@@ -367,9 +367,16 @@ class SshTunnelManager {
     });
   }
 
-  Future<void> _handleSocksClient(
-      Socket client, Function(String) onLog) async {
-    final data = await client.first.timeout(const Duration(seconds: 5));
+  
+Future<void> _handleSocksClient(
+    Socket client, Function(String) onLog) async {
+  final stream = client.asBroadcastStream();
+
+  final data = await stream.first.timeout(const Duration(seconds: 5));
+  if (data[0] != 0x05) { client.destroy(); return; }
+  client.add([0x05, 0x00]);
+
+  final req = await stream.first.timeout(const Duration(seconds: 5));
     if (data[0] != 0x05) { client.destroy(); return; }
     client.add([0x05, 0x00]);
 
