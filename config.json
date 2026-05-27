@@ -49,8 +49,8 @@
       "password": "Anjase1",
       "ping": 0,
       "expiry": "2026-06-03",
-      "payload": "CONNECT [host_port] [protocol][crlf]Host: h.facebook.com[crlf]Connection: Keep-Alive[crlf][crlf]",
-      "sni": "h.facebook.com",
+      "payload": null,
+      "sni": null,
       "uuid": null,
       "notes": "Servidor gratuito vpnjantit — renovar em 2026-06-03",
       "dns": "1.1.1.1",
@@ -58,7 +58,9 @@
       "bufferSize": 65536,
       "keepalive": 30,
       "premium": false,
-      "active": true
+      "active": true,
+      "injectMethod": "none",
+      "socksPort": 1080
     },
     {
       "id": "srv_1779840930982",
