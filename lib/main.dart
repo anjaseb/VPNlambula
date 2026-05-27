@@ -429,10 +429,21 @@ Future<void> _handleSocksClient(
 class _RawSocketWrapper implements SSHSocket {
   final Socket _socket;
   _RawSocketWrapper(this._socket);
-  @override Stream<Uint8List> get stream => _socket.cast<Uint8List>();
-  @override StreamSink<List<int>> get sink => _socket;
-  @override Future<void> close() async => _socket.destroy();
-  @override Future<void> get done => _socket.done;
+
+  @override
+  Stream<Uint8List> get stream => _socket.cast<Uint8List>();
+
+  @override
+  StreamSink<List<int>> get sink => _socket;
+
+  @override
+  Future<void> close() async => _socket.destroy();
+
+  @override
+  Future<void> get done => _socket.done;
+
+  @override
+  void destroy() => _socket.destroy();
 }
 
 // ─── CHANNEL ─────────────────────────────────────
@@ -800,7 +811,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
     decoration: BoxDecoration(
       color: const Color(0xFF080E17),
-      border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha:0.08))),
+      border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
     ),
     child: Row(
       children: [
