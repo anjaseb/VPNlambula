@@ -225,7 +225,7 @@ class SshTunnelManager {
     _client = SSHClient(
       socket,
       username: server.username,
-      onPasswordRequest: () => SSHPasswordRequestReply(password: server.password),
+      onPasswordRequest: () => server.password,,
       keepAliveInterval: Duration(seconds: server.keepalive),
     );
 
