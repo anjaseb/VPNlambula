@@ -529,36 +529,72 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // ── CONFIG ──────────────────────────────────────
 
   Future<void> _loadConfig() async {
-    setState(() { _loadingConfig = true; _configError = null; });
-    try {
-      final prefs   = await SharedPreferences.getInstance();
-      final baseUrl = prefs.getString('config_url') ?? _configUrl;
-      final ts      = DateTime.now().millisecondsSinceEpoch;
-      final r = await http.get(
-        Uri.parse('$baseUrl?t=$ts'),
-        headers: {'Cache-Control': 'no-cache'},
-      ).timeout(const Duration(seconds: 15));
+  setState(() { _loadingConfig = true; _configError = null; });
 
-      if (r.statusCode == 200) {
-        final cfg = AppConfig.fromJson(jsonDecode(r.body));
-        setState(() {
-          _config       = cfg;
-          _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
-          if (_selectedServer == null && cfg.servers.isNotEmpty)
-            _selectedServer = cfg.servers.first;
-          _loadingConfig = false;
-        });
-        _addLog('[CONFIG] ${cfg.servers.length} servidor(es) carregado(s)');
-      } else {
-        throw Exception('HTTP ${r.statusCode}');
-      }
-    } on TimeoutException {
-      setState(() { _loadingConfig = false; _configError = 'Tempo esgotado.'; });
-    } catch (e) {
-      setState(() { _loadingConfig = false; _configError = 'Sem ligacao ao repositorio.'; });
+  final prefs   = await SharedPreferences.getInstance();
+  final baseUrl = prefs.getString('config_url') ?? _configUrl;
+  final ts      = DateTime.now().millisecondsSinceEpoch;
+
+  try {
+    final r = await http.get(
+      Uri.parse('$baseUrl?t=$ts'),
+      headers: {'Cache-Control': 'no-cache'},
+    ).timeout(const Duration(seconds: 15));
+
+    if (r.statusCode == 200) {
+      // ← Guardar em cache sempre que conseguir carregar
+      await prefs.setString('cached_config', r.body);
+
+      final cfg = AppConfig.fromJson(jsonDecode(r.body));
+      setState(() {
+        _config       = cfg;
+        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+        if (_selectedServer == null && cfg.servers.isNotEmpty)
+          _selectedServer = cfg.servers.first;
+        _loadingConfig = false;
+      });
+      _addLog('[CONFIG] ${cfg.servers.length} servidor(es) carregado(s)');
+    } else {
+      throw Exception('HTTP ${r.statusCode}');
+    }
+
+  } on TimeoutException {
+    // ← Sem internet: tentar cache
+    final cached = prefs.getString('cached_config');
+    if (cached != null) {
+      final cfg = AppConfig.fromJson(jsonDecode(cached));
+      setState(() {
+        _config       = cfg;
+        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+        if (_selectedServer == null && cfg.servers.isNotEmpty)
+          _selectedServer = cfg.servers.first;
+        _loadingConfig = false;
+        _configError  = null;
+      });
+      _addLog('[CONFIG] Sem internet — a usar ${cfg.servers.length} servidor(es) em cache');
+    } else {
+      setState(() { _loadingConfig = false; _configError = 'Sem internet e sem cache.'; });
+    }
+
+  } catch (e) {
+    // ← Qualquer outro erro: tentar cache também
+    final cached = prefs.getString('cached_config');
+    if (cached != null) {
+      final cfg = AppConfig.fromJson(jsonDecode(cached));
+      setState(() {
+        _config       = cfg;
+        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+        if (_selectedServer == null && cfg.servers.isNotEmpty)
+          _selectedServer = cfg.servers.first;
+        _loadingConfig = false;
+        _configError  = null;
+      });
+      _addLog('[CONFIG] Erro de rede — a usar ${cfg.servers.length} servidor(es) em cache');
+    } else {
+      setState(() { _loadingConfig = false; _configError = 'Sem ligação ao repositório.'; });
     }
   }
-
+}
   // ── VPN CHANNEL ─────────────────────────────────
 
   void _listenVpnChannel() {
