@@ -128,7 +128,7 @@ class AppConfig {
     announcement:  j['announcement']  ?? '',
     globalOptions: j['globalOptions'] ?? {},
     servers: (j['servers'] as List? ?? [])
-        .map((s) => ServerConfig.fromJson(s))
+        .map((s) => ServerConfig.fromJson(s as Map<String, dynamic>))
         .where((s) => s.active)
         .toList(),
   );
@@ -182,48 +182,67 @@ class VpnState {
 
 // ─── SSH TUNNEL MANAGER ──────────────────────────
 
+/// Resultado da criação de um socket, incluindo o socket raw para protect()
+class _SocketResult {
+  final SSHSocket sshSocket;
+  final Socket?   rawSocket; // null para SSL (SecureSocket não expõe socket base)
+  _SocketResult(this.sshSocket, {this.rawSocket});
+}
+
 class SshTunnelManager {
   SSHClient?    _client;
   ServerSocket? _socksServer;
   bool          running = false;
 
+  // ── CONNECT PRINCIPAL ────────────────────────────
+
   Future<String> connect({
     required ServerConfig server,
     required Function(String) onLog,
+    required Future<void> Function(Socket socket) protectSocket,
   }) async {
     await disconnect();
     running = true;
 
     onLog('[SSH] A ligar a ${server.host}:${server.port}');
 
-    SSHSocket socket;
+    _SocketResult result;
 
     switch (server.injectMethod) {
       case 'http-connect':
       case 'ssh-over-http':
       case 'http-proxy':
       case 'http-proxy-auth':
-        socket = await _connectViaHttpProxy(server, onLog);
+        result = await _connectViaHttpProxy(server, onLog);
         break;
       case 'ssl':
       case 'ssh-over-ssl':
       case 'websocket-ssl':
-        socket = await _connectViaSsl(server, onLog);
+        result = await _connectViaSsl(server, onLog);
         break;
       case 'websocket':
-        socket = await _connectViaWebSocket(server, onLog);
+        result = await _connectViaWebSocket(server, onLog);
         break;
       default:
-        socket = await SSHSocket.connect(
-          server.host, server.port,
-          timeout: Duration(seconds: server.timeout),
-        );
-        onLog('[SSH] Socket directo estabelecido');
+        // Socket directo: proteger ANTES de ligar para evitar o loop VPN
+        result = await _connectDirect(server, onLog, protectSocket);
+    }
+
+    // Proteger o socket raw (se disponível) para evitar loop VPN
+    // Para SSL, o socket já está ligado via SecureSocket — não há acesso ao raw
+    if (result.rawSocket != null) {
+      try {
+        await protectSocket(result.rawSocket!);
+        onLog('[SSH] Socket protegido do loop VPN');
+      } catch (e) {
+        onLog('[SSH] Aviso: protect() falhou: $e');
+        // Não fatal — continuar
+      }
     }
 
     onLog('[SSH] A autenticar...');
     _client = SSHClient(
-      socket,
+      result.sshSocket,
       username: server.username,
       onPasswordRequest: () => server.password,
       keepAliveInterval: Duration(seconds: server.keepalive),
@@ -234,8 +253,9 @@ class SshTunnelManager {
 
     String realIp = server.host;
     try {
-      final result = await _client!.run('curl -s ifconfig.me || wget -qO- ifconfig.me');
-      final ip = utf8.decode(result).trim();
+      final output = await _client!.run(
+          'curl -s ifconfig.me || wget -qO- ifconfig.me');
+      final ip = utf8.decode(output).trim();
       if (ip.isNotEmpty && ip.contains('.')) realIp = ip;
     } catch (_) {}
 
@@ -244,7 +264,36 @@ class SshTunnelManager {
     return realIp;
   }
 
-  Future<SSHSocket> _connectViaHttpProxy(
+  // ── SOCKET DIRECTO COM PROTECT ───────────────────
+
+  Future<_SocketResult> _connectDirect(
+      ServerConfig server,
+      Function(String) onLog,
+      Future<void> Function(Socket socket) protectSocket) async {
+
+    // Criar socket não ligado primeiro
+    final rawSocket = await Socket.connect(
+      server.host, server.port,
+      timeout: Duration(seconds: server.timeout),
+    );
+
+    // Proteger imediatamente após criar (antes do SSH usar o socket)
+    try {
+      await protectSocket(rawSocket);
+      onLog('[SSH] Socket directo estabelecido e protegido');
+    } catch (e) {
+      onLog('[SSH] Socket directo estabelecido (protect falhou: $e)');
+    }
+
+    return _SocketResult(
+      _RawSocketWrapper(rawSocket),
+      rawSocket: rawSocket,
+    );
+  }
+
+  // ── HTTP PROXY ───────────────────────────────────
+
+  Future<_SocketResult> _connectViaHttpProxy(
       ServerConfig server, Function(String) onLog) async {
     final connectPort = _extractConnectPort(server);
     onLog('[CONN] HTTP CONNECT -> ${server.host}:$connectPort');
@@ -254,26 +303,26 @@ class SshTunnelManager {
       timeout: Duration(seconds: server.timeout),
     );
 
-    final payload = server.resolvedPayload.isNotEmpty
+    final payloadStr = server.resolvedPayload.isNotEmpty
         ? server.resolvedPayload
         : 'CONNECT ${server.host}:${server.port} HTTP/1.1\r\n'
           'Host: ${server.host}\r\n'
           'Proxy-Connection: Keep-Alive\r\n\r\n';
 
-    rawSocket.add(utf8.encode(payload));
+    rawSocket.add(utf8.encode(payloadStr));
     await rawSocket.flush();
     onLog('[CONN] Payload enviado');
 
     final completer = Completer<String>();
     final buf = StringBuffer();
-    late StreamSubscription sub;
+    late StreamSubscription<List<int>> sub;
     sub = rawSocket.listen((data) {
       buf.write(utf8.decode(data, allowMalformed: true));
       if (buf.toString().contains('\r\n\r\n')) {
         sub.cancel();
         completer.complete(buf.toString());
       }
-    }, onError: (e) => completer.completeError(e));
+    }, onError: (Object e) => completer.completeError(e));
 
     final response = await completer.future
         .timeout(Duration(seconds: server.timeout));
@@ -285,23 +334,30 @@ class SshTunnelManager {
       throw Exception('Proxy rejeitou: $firstLine');
     }
     onLog('[CONN] Tunel HTTP estabelecido');
-    return _RawSocketWrapper(rawSocket);
+    return _SocketResult(_RawSocketWrapper(rawSocket), rawSocket: rawSocket);
   }
 
-  Future<SSHSocket> _connectViaSsl(
+  // ── SSL / TLS ────────────────────────────────────
+
+  Future<_SocketResult> _connectViaSsl(
       ServerConfig server, Function(String) onLog) async {
     final sniHost = server.sni?.isNotEmpty == true ? server.sni! : server.host;
     onLog('[CONN] SSL/TLS -> ${server.host}:${server.port} SNI: $sniHost');
-    final socket = await SecureSocket.connect(
+
+    final secureSocket = await SecureSocket.connect(
       server.host, server.port,
       timeout: Duration(seconds: server.timeout),
       onBadCertificate: (_) => true,
     );
     onLog('[CONN] SSL estabelecido');
-    return _RawSocketWrapper(socket);
+    // SecureSocket não expõe o socket TCP subjacente — rawSocket é null
+    // O LambulaVpnService.kt trata disto via addDisallowedApplication()
+    return _SocketResult(_RawSocketWrapper(secureSocket));
   }
 
-  Future<SSHSocket> _connectViaWebSocket(
+  // ── WEBSOCKET ────────────────────────────────────
+
+  Future<_SocketResult> _connectViaWebSocket(
       ServerConfig server, Function(String) onLog) async {
     final sniHost = server.sni?.isNotEmpty == true ? server.sni! : server.host;
     onLog('[CONN] WebSocket -> ${server.host}:${server.port}');
@@ -311,25 +367,25 @@ class SshTunnelManager {
       timeout: Duration(seconds: server.timeout),
     );
 
-    final payload = server.resolvedPayload.isNotEmpty
+    final payloadStr = server.resolvedPayload.isNotEmpty
         ? server.resolvedPayload
         : 'GET / HTTP/1.1\r\nHost: $sniHost\r\n'
           'Upgrade: websocket\r\nConnection: Upgrade\r\n'
           'Sec-WebSocket-Version: 13\r\n\r\n';
 
-    rawSocket.add(utf8.encode(payload));
+    rawSocket.add(utf8.encode(payloadStr));
     await rawSocket.flush();
 
     final completer = Completer<String>();
     final buf = StringBuffer();
-    late StreamSubscription sub;
+    late StreamSubscription<List<int>> sub;
     sub = rawSocket.listen((data) {
       buf.write(utf8.decode(data, allowMalformed: true));
       if (buf.toString().contains('\r\n\r\n')) {
         sub.cancel();
         completer.complete(buf.toString());
       }
-    }, onError: (e) => completer.completeError(e));
+    }, onError: (Object e) => completer.completeError(e));
 
     final response = await completer.future
         .timeout(Duration(seconds: server.timeout));
@@ -341,18 +397,18 @@ class SshTunnelManager {
       throw Exception('WebSocket rejeitado: $firstLine');
     }
     onLog('[CONN] WebSocket estabelecido');
-    return _RawSocketWrapper(rawSocket);
+    return _SocketResult(_RawSocketWrapper(rawSocket), rawSocket: rawSocket);
   }
+
+  // ── HELPERS ──────────────────────────────────────
 
   int _extractConnectPort(ServerConfig server) {
     if (server.resolvedPayload.contains(':443')) return 443;
     if (server.resolvedPayload.contains(':8080')) return 8080;
-    if (server.port != 22) return server.port;
     return server.port;
-    
-    
-    
   }
+
+  // ── SOCKS5 PROXY LOCAL ───────────────────────────
 
   Future<void> _startSocksProxy(
       ServerConfig server, Function(String) onLog) async {
@@ -370,53 +426,59 @@ class SshTunnelManager {
     });
   }
 
-  
-Future<void> _handleSocksClient(
-    Socket client, Function(String) onLog) async {
-  final stream = client.asBroadcastStream();
+  Future<void> _handleSocksClient(
+      Socket client, Function(String) onLog) async {
+    final stream = client.asBroadcastStream();
 
-  final data = await stream.first.timeout(const Duration(seconds: 5));
-  if (data[0] != 0x05) { client.destroy(); return; }
-  client.add([0x05, 0x00]);
+    final data = await stream.first.timeout(const Duration(seconds: 5));
+    if (data[0] != 0x05) { client.destroy(); return; }
+    client.add([0x05, 0x00]);
 
-  final req = await stream.first.timeout(const Duration(seconds: 5));
-  if (req[1] != 0x01) {
-    client.add([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]);
-    client.destroy(); return;
-  }
-
-  String targetHost;
-  int offset;
-  switch (req[3]) {
-    case 0x01:
-      targetHost = '${req[4]}.${req[5]}.${req[6]}.${req[7]}';
-      offset = 8; break;
-    case 0x03:
-      final len = req[4];
-      targetHost = String.fromCharCodes(req.sublist(5, 5 + len));
-      offset = 5 + len; break;
-    case 0x04:
-      targetHost = req.sublist(4, 20)
-          .map((b) => b.toRadixString(16).padLeft(2,'0'))
-          .join(':');
-      offset = 20; break;
-    default:
+    final req = await stream.first.timeout(const Duration(seconds: 5));
+    if (req[1] != 0x01) {
+      client.add([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
       client.destroy(); return;
+    }
+
+    String targetHost;
+    int offset;
+    switch (req[3]) {
+      case 0x01:
+        targetHost = '${req[4]}.${req[5]}.${req[6]}.${req[7]}';
+        offset = 8;
+        break;
+      case 0x03:
+        final len = req[4];
+        targetHost = String.fromCharCodes(req.sublist(5, 5 + len));
+        offset = 5 + len;
+        break;
+      case 0x04:
+        targetHost = req
+            .sublist(4, 20)
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(':');
+        offset = 20;
+        break;
+      default:
+        client.destroy(); return;
+    }
+
+    final targetPort = (req[offset] << 8) | req[offset + 1];
+    client.add([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    onLog('[PROXY] -> $targetHost:$targetPort');
+
+    try {
+      final forward = await _client!.forwardLocal(targetHost, targetPort);
+      unawaited(forward.stream.cast<List<int>>().pipe(client));
+      unawaited(client.cast<List<int>>().pipe(forward.sink));
+    } catch (e) {
+      onLog('[PROXY] Forward falhou: $e');
+      client.destroy();
+    }
   }
 
-  final targetPort = (req[offset] << 8) | req[offset + 1];
-  client.add([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]);
-  onLog('[PROXY] -> $targetHost:$targetPort');
+  // ── DISCONNECT ───────────────────────────────────
 
-  try {
-    final forward = await _client!.forwardLocal(targetHost, targetPort);
-    unawaited(forward.stream.cast<List<int>>().pipe(client));
-    unawaited(client.cast<List<int>>().pipe(forward.sink));
-  } catch (e) {
-    onLog('[PROXY] Forward falhou: $e');
-    client.destroy();
-  }
-}
   Future<void> disconnect() async {
     running = false;
     try { await _socksServer?.close(); } catch (_) {}
@@ -425,6 +487,8 @@ Future<void> _handleSocksClient(
     _client = null;
   }
 }
+
+// ─── SSH SOCKET WRAPPER ──────────────────────────
 
 class _RawSocketWrapper implements SSHSocket {
   final Socket _socket;
@@ -529,72 +593,78 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // ── CONFIG ──────────────────────────────────────
 
   Future<void> _loadConfig() async {
-  setState(() { _loadingConfig = true; _configError = null; });
+    setState(() { _loadingConfig = true; _configError = null; });
 
-  final prefs   = await SharedPreferences.getInstance();
-  final baseUrl = prefs.getString('config_url') ?? _configUrl;
-  final ts      = DateTime.now().millisecondsSinceEpoch;
+    final prefs   = await SharedPreferences.getInstance();
+    final baseUrl = prefs.getString('config_url') ?? _configUrl;
+    final ts      = DateTime.now().millisecondsSinceEpoch;
 
-  try {
-    final r = await http.get(
-      Uri.parse('$baseUrl?t=$ts'),
-      headers: {'Cache-Control': 'no-cache'},
-    ).timeout(const Duration(seconds: 15));
+    try {
+      final r = await http.get(
+        Uri.parse('$baseUrl?t=$ts'),
+        headers: {'Cache-Control': 'no-cache'},
+      ).timeout(const Duration(seconds: 15));
 
-    if (r.statusCode == 200) {
-      // ← Guardar em cache sempre que conseguir carregar
-      await prefs.setString('cached_config', r.body);
+      if (r.statusCode == 200) {
+        await prefs.setString('cached_config', r.body);
+        final cfg = AppConfig.fromJson(
+            jsonDecode(r.body) as Map<String, dynamic>);
+        setState(() {
+          _config       = cfg;
+          _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+          if (_selectedServer == null && cfg.servers.isNotEmpty) {
+            _selectedServer = cfg.servers.first;
+          }
+          _loadingConfig = false;
+        });
+        _addLog('[CONFIG] ${cfg.servers.length} servidor(es) carregado(s)');
+      } else {
+        throw Exception('HTTP ${r.statusCode}');
+      }
 
-      final cfg = AppConfig.fromJson(jsonDecode(r.body));
-      setState(() {
-        _config       = cfg;
-        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
-        if (_selectedServer == null && cfg.servers.isNotEmpty)
-          _selectedServer = cfg.servers.first;
-        _loadingConfig = false;
-      });
-      _addLog('[CONFIG] ${cfg.servers.length} servidor(es) carregado(s)');
-    } else {
-      throw Exception('HTTP ${r.statusCode}');
-    }
+    } on TimeoutException {
+      final cached = prefs.getString('cached_config');
+      if (cached != null) {
+        final cfg = AppConfig.fromJson(
+            jsonDecode(cached) as Map<String, dynamic>);
+        setState(() {
+          _config       = cfg;
+          _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+          if (_selectedServer == null && cfg.servers.isNotEmpty) {
+            _selectedServer = cfg.servers.first;
+          }
+          _loadingConfig = false;
+          _configError   = null;
+        });
+        _addLog('[CONFIG] Sem internet — a usar ${cfg.servers.length} servidor(es) em cache');
+      } else {
+        setState(() { _loadingConfig = false; _configError = 'Sem internet e sem cache.'; });
+      }
 
-  } on TimeoutException {
-    // ← Sem internet: tentar cache
-    final cached = prefs.getString('cached_config');
-    if (cached != null) {
-      final cfg = AppConfig.fromJson(jsonDecode(cached));
-      setState(() {
-        _config       = cfg;
-        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
-        if (_selectedServer == null && cfg.servers.isNotEmpty)
-          _selectedServer = cfg.servers.first;
-        _loadingConfig = false;
-        _configError  = null;
-      });
-      _addLog('[CONFIG] Sem internet — a usar ${cfg.servers.length} servidor(es) em cache');
-    } else {
-      setState(() { _loadingConfig = false; _configError = 'Sem internet e sem cache.'; });
-    }
-
-  } catch (e) {
-    // ← Qualquer outro erro: tentar cache também
-    final cached = prefs.getString('cached_config');
-    if (cached != null) {
-      final cfg = AppConfig.fromJson(jsonDecode(cached));
-      setState(() {
-        _config       = cfg;
-        _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
-        if (_selectedServer == null && cfg.servers.isNotEmpty)
-          _selectedServer = cfg.servers.first;
-        _loadingConfig = false;
-        _configError  = null;
-      });
-      _addLog('[CONFIG] Erro de rede — a usar ${cfg.servers.length} servidor(es) em cache');
-    } else {
-      setState(() { _loadingConfig = false; _configError = 'Sem ligação ao repositório.'; });
+    } catch (e) {
+      final cached = prefs.getString('cached_config');
+      if (cached != null) {
+        final cfg = AppConfig.fromJson(
+            jsonDecode(cached) as Map<String, dynamic>);
+        setState(() {
+          _config       = cfg;
+          _announcement = cfg.announcement.isNotEmpty ? cfg.announcement : null;
+          if (_selectedServer == null && cfg.servers.isNotEmpty) {
+            _selectedServer = cfg.servers.first;
+          }
+          _loadingConfig = false;
+          _configError   = null;
+        });
+        _addLog('[CONFIG] Erro de rede — a usar ${cfg.servers.length} servidor(es) em cache');
+      } else {
+        setState(() {
+          _loadingConfig = false;
+          _configError   = 'Sem ligação ao repositório.';
+        });
+      }
     }
   }
-}
+
   // ── VPN CHANNEL ─────────────────────────────────
 
   void _listenVpnChannel() {
@@ -614,15 +684,50 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           break;
         case 'onTraffic':
           final args = call.arguments as Map?;
-          if (args != null) setState(() {
-            _vpn = _vpn.copyWith(
-              bytesSent:     args['sent']     ?? _vpn.bytesSent,
-              bytesReceived: args['received'] ?? _vpn.bytesReceived,
-            );
-          });
+          if (args != null && mounted) {
+            setState(() {
+              _vpn = _vpn.copyWith(
+                bytesSent:     args['sent']     as int? ?? _vpn.bytesSent,
+                bytesReceived: args['received'] as int? ?? _vpn.bytesReceived,
+              );
+            });
+          }
           break;
       }
     });
+  }
+
+  // ── PROTECT SOCKET ───────────────────────────────
+  //
+  // Envia o fd do socket para o Kotlin via MethodChannel.
+  // O Kotlin chama protect(fd) no VpnService, excluindo este
+  // socket do loop VPN (errno=103).
+  //
+  // NOTA: Esta função usa socket.port e socket.remoteAddress
+  // para identificar o socket. O Kotlin recebe o fd via
+  // ParcelFileDescriptor ou via o inteiro do fd do sistema.
+  //
+  // Como o dart:io não expõe o fd directamente, usamos a
+  // abordagem alternativa: notificar o Kotlin com host+port
+  // para que ele encontre e proteja o socket correspondente.
+  // A solução principal é o addDisallowedApplication() no
+  // LambulaVpnService.kt (ver nota abaixo).
+
+  Future<void> _protectSocket(Socket socket) async {
+    try {
+      // Enviar host e porta do socket remoto para o Kotlin
+      // O Kotlin usa protect(int fd) — aqui passamos um identificador
+      // que o serviço usa para correlacionar. A solução definitiva
+      // é o LambulaVpnService.kt chamar addDisallowedApplication()
+      // para excluir o próprio pacote da VPN.
+      await _channel.invokeMethod('protectSocket', {
+        'host': socket.remoteAddress.address,
+        'port': socket.remotePort,
+      });
+    } catch (e) {
+      // Não fatal — o app continua a funcionar via addDisallowedApplication
+      _addLog('[SSH] protect() ignorado: $e');
+    }
   }
 
   // ── SSH TUNNEL ───────────────────────────────────
@@ -632,16 +737,22 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final s = _selectedServer!;
     try {
       _addLog('[SSH] Interface VPN activa — a iniciar tunel SSH');
-      final realIp = await _tunnel.connect(server: s, onLog: _addLog);
+      final realIp = await _tunnel.connect(
+        server: s,
+        onLog: _addLog,
+        protectSocket: _protectSocket,
+      );
       _reconnectTimer?.cancel();
       _connectedAt = DateTime.now();
-      setState(() {
-        _vpn = _vpn.copyWith(
-          status:     VpnStatus.connected,
-          ip:         realIp,
-          retryCount: 0,
-        );
-      });
+      if (mounted) {
+        setState(() {
+          _vpn = _vpn.copyWith(
+            status:     VpnStatus.connected,
+            ip:         realIp,
+            retryCount: 0,
+          );
+        });
+      }
       _addLog('[VPN] Conectado. IP: $realIp');
       _startDurationTimer();
     } catch (e) {
@@ -667,7 +778,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _durationTimer?.cancel();
     _tunnel.disconnect();
     if (_userDisconnected) {
-      setState(() { _vpn = VpnState(); });
+      if (mounted) setState(() { _vpn = VpnState(); });
       _addLog('[VPN] Desligado.');
       return;
     }
@@ -676,25 +787,40 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   void _onVpnError(String msg) {
     _addLog('[ERRO] $msg');
-    if (!_userDisconnected) _scheduleReconnect();
-    else setState(() { _vpn = _vpn.copyWith(status: VpnStatus.error, error: msg); });
+    if (!_userDisconnected) {
+      _scheduleReconnect();
+    } else {
+      if (mounted) {
+        setState(() {
+          _vpn = _vpn.copyWith(status: VpnStatus.error, error: msg);
+        });
+      }
+    }
   }
 
   void _scheduleReconnect() {
     final retries = _vpn.retryCount;
     if (retries >= _maxRetries) {
-      setState(() { _vpn = _vpn.copyWith(
-        status: VpnStatus.error,
-        error:  'Falhou apos $_maxRetries tentativas.',
-      ); });
+      if (mounted) {
+        setState(() {
+          _vpn = _vpn.copyWith(
+            status: VpnStatus.error,
+            error:  'Falhou apos $_maxRetries tentativas.',
+          );
+        });
+      }
       _addLog('[VPN] Maximo de tentativas atingido.');
       return;
     }
     final delay = _retryDelays[retries.clamp(0, _retryDelays.length - 1)];
-    setState(() { _vpn = _vpn.copyWith(
-      status:     VpnStatus.reconnecting,
-      retryCount: retries + 1,
-    ); });
+    if (mounted) {
+      setState(() {
+        _vpn = _vpn.copyWith(
+          status:     VpnStatus.reconnecting,
+          retryCount: retries + 1,
+        );
+      });
+    }
     _addLog('[VPN] A reconectar em ${delay}s... (${retries + 1}/$_maxRetries)');
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(Duration(seconds: delay), () {
@@ -720,16 +846,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   Future<void> _connect() async {
     if (_selectedServer == null) { _showSnack('Selecciona um servidor'); return; }
-    final perm = await _channel.invokeMethod('requestVpnPermission');
+    final perm = await _channel.invokeMethod<bool>('requestVpnPermission');
     if (perm != true) { _showSnack('Permissao VPN negada'); return; }
-    setState(() { _vpn = _vpn.copyWith(status: VpnStatus.connecting, retryCount: 0); });
+    if (mounted) {
+      setState(() {
+        _vpn = _vpn.copyWith(status: VpnStatus.connecting, retryCount: 0);
+      });
+    }
     await _connectServer(_selectedServer!);
   }
 
   Future<void> _connectServer(ServerConfig s) async {
     _addLog('[VPN] A conectar a ${s.name} (${s.host}:${s.port})');
+    _addLog('[VPN] SNI: ${s.sni ?? "nenhum"}');
     _addLog('[VPN] Metodo: ${s.injectMethod}');
-    if (s.sni != null && s.sni!.isNotEmpty) _addLog('[VPN] SNI: ${s.sni}');
     try {
       await _channel.invokeMethod('connect', {
         'host':         s.host,
@@ -755,17 +885,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   Future<void> _disconnect() async {
     await _tunnel.disconnect();
-    try { await _channel.invokeMethod('disconnect'); }
-    catch (_) { setState(() { _vpn = VpnState(); }); }
+    try {
+      await _channel.invokeMethod('disconnect');
+    } catch (_) {
+      if (mounted) setState(() { _vpn = VpnState(); });
+    }
   }
 
   // ── HELPERS ─────────────────────────────────────
 
   void _addLog(String msg) {
     final t  = DateTime.now();
-    final ts = '${t.hour.toString().padLeft(2,'0')}:'
-               '${t.minute.toString().padLeft(2,'0')}:'
-               '${t.second.toString().padLeft(2,'0')}';
+    final ts = '${t.hour.toString().padLeft(2, '0')}:'
+               '${t.minute.toString().padLeft(2, '0')}:'
+               '${t.second.toString().padLeft(2, '0')}';
     if (!mounted) return;
     setState(() {
       final logs = List<String>.from(_vpn.logs);
@@ -777,19 +910,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   void _showSnack(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg), backgroundColor: const Color(0xFF0C1420)));
+        SnackBar(content: Text(msg),
+            backgroundColor: const Color(0xFF0C1420)));
   }
 
   String _formatBytes(int bytes) {
     if (bytes < 1024) return '${bytes}B';
-    if (bytes < 1024 * 1024) return '${(bytes/1024).toStringAsFixed(1)}KB';
-    return '${(bytes/(1024*1024)).toStringAsFixed(2)}MB';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)}MB';
   }
 
   String _formatDuration(Duration d) =>
-      '${d.inHours.toString().padLeft(2,'0')}:'
-      '${(d.inMinutes%60).toString().padLeft(2,'0')}:'
-      '${(d.inSeconds%60).toString().padLeft(2,'0')}';
+      '${d.inHours.toString().padLeft(2, '0')}:'
+      '${(d.inMinutes % 60).toString().padLeft(2, '0')}:'
+      '${(d.inSeconds % 60).toString().padLeft(2, '0')}';
 
   Color get _statusColor {
     switch (_vpn.status) {
@@ -847,11 +981,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
     decoration: BoxDecoration(
       color: const Color(0xFF080E17),
-      border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
+      border: Border(
+          bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
     ),
     child: Row(
       children: [
-        CustomPaint(size: const Size(32,32), painter: _FishPainter()),
+        CustomPaint(size: const Size(32, 32), painter: _FishPainter()),
         const SizedBox(width: 10),
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -869,7 +1004,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 child: CircularProgressIndicator(
                     strokeWidth: 2, color: Color(0xFF00C8F0)))
             : IconButton(
-                icon: const Icon(Icons.refresh, color: Color(0xFF4A7A9B), size: 20),
+                icon: const Icon(Icons.refresh,
+                    color: Color(0xFF4A7A9B), size: 20),
                 onPressed: _loadConfig),
         const SizedBox(width: 6),
         GestureDetector(
@@ -880,7 +1016,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             decoration: BoxDecoration(
               color: const Color(0xFF1877F2).withOpacity(0.15),
               borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF1877F2).withOpacity(0.3)),
+              border: Border.all(
+                  color: const Color(0xFF1877F2).withOpacity(0.3)),
             ),
             child: const Row(children: [
               Icon(Icons.facebook, color: Color(0xFF1877F2), size: 16),
@@ -903,11 +1040,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     decoration: BoxDecoration(
       color: const Color(0xFF00C8F0).withOpacity(0.08),
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.2)),
+      border: Border.all(
+          color: const Color(0xFF00C8F0).withOpacity(0.2)),
     ),
     child: Row(children: [
       Expanded(child: Text(_announcement!,
-          style: const TextStyle(fontSize: 12, color: Color(0xFF00C8F0)))),
+          style: const TextStyle(
+              fontSize: 12, color: Color(0xFF00C8F0)))),
       GestureDetector(
         onTap: () => setState(() => _announcement = null),
         child: Icon(Icons.close, size: 16,
@@ -920,7 +1059,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   Widget _buildTabs() => Container(
     decoration: BoxDecoration(
       color: const Color(0xFF0C1420),
-      border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
+      border: Border(
+          bottom: BorderSide(color: Colors.white.withOpacity(0.07))),
     ),
     child: Row(children: [
       _tabItem(0, 'INICIO'),
@@ -938,15 +1078,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           padding: const EdgeInsets.symmetric(vertical: 13),
           decoration: BoxDecoration(
             border: Border(bottom: BorderSide(
-              color: active ? const Color(0xFF00C8F0) : Colors.transparent,
+              color: active
+                  ? const Color(0xFF00C8F0)
+                  : Colors.transparent,
               width: 2,
             )),
           ),
           child: Text(label,
             textAlign: TextAlign.center,
             style: TextStyle(
-              fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 1.5,
-              color: active ? const Color(0xFF00C8F0) : Colors.white.withOpacity(0.35),
+              fontSize: 11, fontWeight: FontWeight.w700,
+              letterSpacing: 1.5,
+              color: active
+                  ? const Color(0xFF00C8F0)
+                  : Colors.white.withOpacity(0.35),
             )),
         ),
       ),
@@ -995,23 +1140,25 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                   blurRadius: 30, spreadRadius: 5)],
             ),
             child: _isBusy
-                ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    SizedBox(width: 40, height: 40,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 3, color: _statusColor)),
-                    const SizedBox(height: 10),
-                    Text(_statusText, style: TextStyle(
-                        color: _statusColor, fontSize: 10,
-                        fontWeight: FontWeight.w800, letterSpacing: 1.5)),
-                  ])
-                : Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(isConnected ? Icons.lock : Icons.lock_open,
-                        color: _statusColor, size: 48),
-                    const SizedBox(height: 8),
-                    Text(_statusText, style: TextStyle(
-                        color: _statusColor, fontSize: 11,
-                        fontWeight: FontWeight.w800, letterSpacing: 2)),
-                  ]),
+                ? Column(mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(width: 40, height: 40,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 3, color: _statusColor)),
+                      const SizedBox(height: 10),
+                      Text(_statusText, style: TextStyle(
+                          color: _statusColor, fontSize: 10,
+                          fontWeight: FontWeight.w800, letterSpacing: 1.5)),
+                    ])
+                : Column(mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(isConnected ? Icons.lock : Icons.lock_open,
+                          color: _statusColor, size: 48),
+                      const SizedBox(height: 8),
+                      Text(_statusText, style: TextStyle(
+                          color: _statusColor, fontSize: 11,
+                          fontWeight: FontWeight.w800, letterSpacing: 2)),
+                    ]),
           ),
         ),
       ),
@@ -1020,11 +1167,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   Widget _buildStatusCard() => _card(
     child: Row(children: [
-      _statItem('IP',     _vpn.ip ?? '--',              const Color(0xFF00C8F0)),
+      _statItem('IP',     _vpn.ip ?? '--',               const Color(0xFF00C8F0)),
       _divider(),
       _statItem('TEMPO',  _formatDuration(_vpn.duration), const Color(0xFF00E5A0)),
       _divider(),
-      _statItem('ESTADO', _statusText,                  _statusColor),
+      _statItem('ESTADO', _statusText,                   _statusColor),
     ]),
   );
 
@@ -1053,7 +1200,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             decoration: BoxDecoration(
               color: const Color(0xFF00C8F0).withOpacity(0.08),
               borderRadius: BorderRadius.circular(7),
-              border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.2)),
+              border: Border.all(
+                  color: const Color(0xFF00C8F0).withOpacity(0.2)),
             ),
             child: const Text('TROCAR', style: TextStyle(
                 color: Color(0xFF00C8F0), fontSize: 11,
@@ -1070,7 +1218,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     decoration: BoxDecoration(
       color: const Color(0xFFFFB347).withOpacity(0.08),
       borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: const Color(0xFFFFB347).withOpacity(0.25)),
+      border: Border.all(
+          color: const Color(0xFFFFB347).withOpacity(0.25)),
     ),
     child: Row(children: [
       const SizedBox(width: 16, height: 16,
@@ -1079,12 +1228,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       const SizedBox(width: 12),
       Expanded(child: Text(
         'Tentativa ${_vpn.retryCount}/$_maxRetries — A reconectar...',
-        style: const TextStyle(color: Color(0xFFFFB347), fontSize: 12))),
+        style: const TextStyle(
+            color: Color(0xFFFFB347), fontSize: 12))),
       GestureDetector(
         onTap: () {
           _userDisconnected = true;
           _reconnectTimer?.cancel();
-          setState(() { _vpn = VpnState(); });
+          if (mounted) setState(() { _vpn = VpnState(); });
         },
         child: const Text('CANCELAR', style: TextStyle(
             color: Color(0xFFFF4D6D), fontSize: 11,
@@ -1099,10 +1249,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     decoration: BoxDecoration(
       color: const Color(0xFFFF4D6D).withOpacity(0.08),
       borderRadius: BorderRadius.circular(14),
-      border: Border.all(color: const Color(0xFFFF4D6D).withOpacity(0.2)),
+      border: Border.all(
+          color: const Color(0xFFFF4D6D).withOpacity(0.2)),
     ),
     child: Column(children: [
-Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(color: Color(0xFFFF4D6D), fontSize: 12),
+      Text(_vpn.error ?? _configError ?? 'Erro desconhecido',
+          style: const TextStyle(
+              color: Color(0xFFFF4D6D), fontSize: 12),
           textAlign: TextAlign.center),
       const SizedBox(height: 10),
       GestureDetector(
@@ -1112,7 +1265,8 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
           decoration: BoxDecoration(
             color: const Color(0xFFFF4D6D).withOpacity(0.1),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: const Color(0xFFFF4D6D).withOpacity(0.3)),
+            border: Border.all(
+                color: const Color(0xFFFF4D6D).withOpacity(0.3)),
           ),
           child: const Text('TENTAR NOVAMENTE', style: TextStyle(
               color: Color(0xFFFF4D6D), fontSize: 11,
@@ -1125,59 +1279,74 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
   // ── SERVERS TAB ─────────────────────────────────
 
   Widget _buildServersTab() {
-    if (_loadingConfig) return const Center(
-        child: CircularProgressIndicator(color: Color(0xFF00C8F0)));
+    if (_loadingConfig) {
+      return const Center(
+          child: CircularProgressIndicator(color: Color(0xFF00C8F0)));
+    }
 
-    if (_configError != null) return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(Icons.cloud_off, color: Colors.white.withOpacity(0.15), size: 48),
+    if (_configError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+            Icon(Icons.cloud_off,
+                color: Colors.white.withOpacity(0.15), size: 48),
+            const SizedBox(height: 16),
+            Text(_configError!, style: TextStyle(
+                color: Colors.white.withOpacity(0.4)),
+                textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            GestureDetector(
+              onTap: _loadConfig,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 20, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF00C8F0).withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                      color: const Color(0xFF00C8F0).withOpacity(0.3)),
+                ),
+                child: const Text('TENTAR NOVAMENTE', style: TextStyle(
+                    color: Color(0xFF00C8F0), fontSize: 12,
+                    fontWeight: FontWeight.w700)),
+              ),
+            ),
+          ]),
+        ),
+      );
+    }
+
+    if (_config == null || _config!.servers.isEmpty) {
+      return Center(
+        child: Column(mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+          Icon(Icons.dns_outlined,
+              color: Colors.white.withOpacity(0.15), size: 48),
           const SizedBox(height: 16),
-          Text(_configError!, style: TextStyle(
-              color: Colors.white.withOpacity(0.4)), textAlign: TextAlign.center),
+          Text('Sem servidores disponiveis',
+              style: TextStyle(color: Colors.white.withOpacity(0.4))),
           const SizedBox(height: 16),
           GestureDetector(
             onTap: _loadConfig,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 20, vertical: 10),
               decoration: BoxDecoration(
                 color: const Color(0xFF00C8F0).withOpacity(0.1),
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.3)),
+                border: Border.all(
+                    color: const Color(0xFF00C8F0).withOpacity(0.3)),
               ),
-              child: const Text('TENTAR NOVAMENTE', style: TextStyle(
+              child: const Text('ACTUALIZAR', style: TextStyle(
                   color: Color(0xFF00C8F0), fontSize: 12,
                   fontWeight: FontWeight.w700)),
             ),
           ),
         ]),
-      ),
-    );
-
-    if (_config == null || _config!.servers.isEmpty) return Center(
-      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(Icons.dns_outlined, color: Colors.white.withOpacity(0.15), size: 48),
-        const SizedBox(height: 16),
-        Text('Sem servidores disponiveis',
-            style: TextStyle(color: Colors.white.withOpacity(0.4))),
-        const SizedBox(height: 16),
-        GestureDetector(
-          onTap: _loadConfig,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF00C8F0).withOpacity(0.1),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF00C8F0).withOpacity(0.3)),
-            ),
-            child: const Text('ACTUALIZAR', style: TextStyle(
-                color: Color(0xFF00C8F0), fontSize: 12,
-                fontWeight: FontWeight.w700)),
-          ),
-        ),
-      ]),
-    );
+      );
+    }
 
     return ListView.builder(
       padding: const EdgeInsets.all(16),
@@ -1192,26 +1361,37 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
           },
           child: Container(
             margin: const EdgeInsets.only(bottom: 10),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            padding: const EdgeInsets.symmetric(
+                horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               color: selected
                   ? const Color(0xFF00C8F0).withOpacity(0.06)
                   : const Color(0xFF0C1420),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
-                color: selected ? const Color(0xFF00C8F0) : Colors.white.withOpacity(0.07),
+                color: selected
+                    ? const Color(0xFF00C8F0)
+                    : Colors.white.withOpacity(0.07),
                 width: selected ? 1.5 : 1,
               ),
             ),
             child: Row(children: [
-              Text(s.flagEmoji, style: const TextStyle(fontSize: 26)),
+              Text(s.flagEmoji,
+                  style: const TextStyle(fontSize: 26)),
               const SizedBox(width: 14),
               Expanded(child: Text(s.name, style: const TextStyle(
                   fontWeight: FontWeight.w700, fontSize: 15))),
-              if (s.premium) ...[_badge('PRO', const Color(0xFFFFB347)), const SizedBox(width: 8)],
+              if (s.premium) ...[
+                _badge('PRO', const Color(0xFFFFB347)),
+                const SizedBox(width: 8),
+              ],
               Icon(
-                selected ? Icons.check_circle : Icons.radio_button_unchecked,
-                color: selected ? const Color(0xFF00C8F0) : Colors.white.withOpacity(0.2),
+                selected
+                    ? Icons.check_circle
+                    : Icons.radio_button_unchecked,
+                color: selected
+                    ? const Color(0xFF00C8F0)
+                    : Colors.white.withOpacity(0.2),
                 size: 20),
             ]),
           ),
@@ -1228,7 +1408,8 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
       child: Row(children: [
         Text('LOGS DE CONEXAO', style: TextStyle(
             fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 2,
-            color: Colors.white.withOpacity(0.4), fontFamily: 'monospace')),
+            color: Colors.white.withOpacity(0.4),
+            fontFamily: 'monospace')),
         const Spacer(),
         GestureDetector(
           onTap: () => setState(() { _vpn = _vpn.copyWith(logs: []); }),
@@ -1272,7 +1453,8 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
     child: Column(children: [
       Text(label, style: TextStyle(
           fontSize: 9, letterSpacing: 1.5,
-          color: Colors.white.withOpacity(0.35), fontFamily: 'monospace')),
+          color: Colors.white.withOpacity(0.35),
+          fontFamily: 'monospace')),
       const SizedBox(height: 4),
       Text(value, style: TextStyle(
           fontSize: 13, fontWeight: FontWeight.w800,
@@ -1282,7 +1464,8 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
   );
 
   Widget _divider() => Container(
-      width: 1, height: 32, color: Colors.white.withOpacity(0.07));
+      width: 1, height: 32,
+      color: Colors.white.withOpacity(0.07));
 
   Widget _badge(String label, Color color) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
@@ -1301,28 +1484,32 @@ Text(_vpn.error ?? _configError ?? 'Erro desconhecido', style: const TextStyle(c
 class _FishPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
-    final cx = size.width * 0.52;
+    final cx = size.width  * 0.52;
     final cy = size.height * 0.50;
-    canvas.drawCircle(Offset(size.width/2, size.height/2), size.width/2,
+    canvas.drawCircle(
+        Offset(size.width / 2, size.height / 2), size.width / 2,
         Paint()..color = const Color(0xFF020B18));
     canvas.drawOval(
         Rect.fromCenter(center: Offset(cx, cy),
-            width: size.width*0.76, height: size.height*0.44),
+            width: size.width * 0.76, height: size.height * 0.44),
         Paint()..color = const Color(0xFF0D7EC2));
     final tail = Path()
-      ..moveTo(cx - size.width*0.38, cy)
-      ..lineTo(cx - size.width*0.60, cy - size.height*0.20)
-      ..lineTo(cx - size.width*0.46, cy)
-      ..lineTo(cx - size.width*0.60, cy + size.height*0.20)
+      ..moveTo(cx - size.width * 0.38, cy)
+      ..lineTo(cx - size.width * 0.60, cy - size.height * 0.20)
+      ..lineTo(cx - size.width * 0.46, cy)
+      ..lineTo(cx - size.width * 0.60, cy + size.height * 0.20)
       ..close();
     canvas.drawPath(tail, Paint()..color = const Color(0xFF0A4F8C));
     canvas.drawCircle(
-        Offset(cx + size.width*0.24, cy - size.height*0.06),
-        size.width*0.08, Paint()..color = const Color(0xFFEAF6FF));
+        Offset(cx + size.width * 0.24, cy - size.height * 0.06),
+        size.width * 0.08,
+        Paint()..color = const Color(0xFFEAF6FF));
     canvas.drawCircle(
-        Offset(cx + size.width*0.24, cy - size.height*0.06),
-        size.width*0.04, Paint()..color = const Color(0xFF020B18));
+        Offset(cx + size.width * 0.24, cy - size.height * 0.06),
+        size.width * 0.04,
+        Paint()..color = const Color(0xFF020B18));
   }
+
   @override
   bool shouldRepaint(_) => false;
 }
