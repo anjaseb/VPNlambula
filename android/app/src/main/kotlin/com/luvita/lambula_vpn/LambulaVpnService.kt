@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.*
@@ -22,8 +24,8 @@ class LambulaVpnService : VpnService() {
 
         var eventCallback: ((String, Any?) -> Unit)? = null
 
-        // Referência à instância activa do serviço.
-        // Usada pelo MainActivity para delegar o protect().
+        // Referência à instância activa — usada pelo MainActivity
+        // para delegar o protectSocketByAddress()
         @Volatile
         var instance: LambulaVpnService? = null
     }
@@ -162,9 +164,7 @@ class LambulaVpnService : VpnService() {
     //
     // addDisallowedApplication(packageName) diz ao Android para NÃO
     // passar o tráfego do próprio app pelo túnel VPN.
-    // Isto quebra o loop:
-    //   socket SSH → VPN → socket SSH → ...
-    // O próprio app passa directamente pela rede física.
+    // O socket SSH vai directamente pela rede física — sem loop.
     // Todos os outros apps continuam a passar pela VPN normalmente.
 
     private fun buildVpnInterface(config: VpnConfig): ParcelFileDescriptor {
@@ -179,7 +179,7 @@ class LambulaVpnService : VpnService() {
             .addDnsServer("8.8.8.8")
             .setMtu(1500)
             // ↓ CORRECÇÃO CRÍTICA: excluir o próprio app do túnel VPN
-            // Evita o loop que causava errno=103
+            // Quebra o loop que causava errno=103
             .addDisallowedApplication(packageName)
             .establish()
             ?: throw IOException("Falha ao criar interface VPN")
@@ -187,9 +187,7 @@ class LambulaVpnService : VpnService() {
 
     // ── PROTECT SOCKET POR ENDEREÇO ─────────────────
     //
-    // Camada extra de protecção usada pelo MainActivity.
-    // Cria um socket temporário ligado ao mesmo host:port
-    // e chama protect() nele.
+    // Camada extra usada pelo MainActivity via MethodChannel.
     // A protecção principal é o addDisallowedApplication() acima.
 
     fun protectSocketByAddress(host: String, port: Int): Boolean {
@@ -197,7 +195,7 @@ class LambulaVpnService : VpnService() {
             val socket = Socket()
             val ok = protect(socket)
             socket.close()
-            sendLog("[VPN] protect() aplicado para $host:$port — resultado: $ok")
+            sendLog("[VPN] protect() para $host:$port — ok=$ok")
             ok
         } catch (e: Exception) {
             Log.w(TAG, "protectSocketByAddress falhou: ${e.message}")
@@ -234,14 +232,21 @@ class LambulaVpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE)
 
-        startForeground(1,
-            Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("Lambula VPN")
-                .setContentText("VPN activa — LuVita")
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentIntent(pending)
-                .setOngoing(true)
-                .build())
+        val notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Lambula VPN")
+            .setContentText("VPN activa — LuVita")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pending)
+            .setOngoing(true)
+            .build()
+
+        // Android 14+ (API 34) exige o tipo explícito no startForeground()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1, notification)
+        }
     }
 
     // ── EVENTOS ─────────────────────────────────────
