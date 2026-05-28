@@ -5,6 +5,7 @@ import android.net.VpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.net.Socket
 
 class MainActivity : FlutterActivity() {
 
@@ -64,11 +65,22 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                // ← NOVO: protege o socket SSH do loop VPN
+                "protectSocket" -> {
+                    try {
+                        val fd = call.arguments as Int
+                        val socket = Socket()
+                        val protected = protect(socket)
+                        result.success(protected)
+                    } catch (e: Exception) {
+                        result.error("PROTECT_ERROR", e.message, null)
+                    }
+                }
+
                 else -> result.notImplemented()
             }
         }
 
-        // Receber eventos do serviço VPN para o Flutter
         LambulaVpnService.eventCallback = { method, args ->
             runOnUiThread {
                 methodChannel.invokeMethod(method, args)
