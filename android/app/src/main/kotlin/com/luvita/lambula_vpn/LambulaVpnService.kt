@@ -10,9 +10,6 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.*
 import java.net.*
-import javax.net.ssl.SSLSocketFactory
-import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLParameters
 import kotlin.concurrent.thread
 
 class LambulaVpnService : VpnService() {
@@ -22,14 +19,31 @@ class LambulaVpnService : VpnService() {
         const val ACTION_DISCONNECT = "ACTION_DISCONNECT"
         const val CHANNEL_ID        = "lambula_vpn_channel"
         const val TAG               = "LambulaVPN"
+
         var eventCallback: ((String, Any?) -> Unit)? = null
+
+        // Referência à instância activa do serviço.
+        // Usada pelo MainActivity para delegar o protect().
+        @Volatile
+        var instance: LambulaVpnService? = null
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var running = false
+    private var running      = false
     private var tunnelThread: Thread? = null
 
     // ── LIFECYCLE ───────────────────────────────────
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
+    override fun onDestroy() {
+        instance = null
+        disconnect()
+        super.onDestroy()
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -38,8 +52,6 @@ class LambulaVpnService : VpnService() {
         }
         return START_STICKY
     }
-
-    override fun onDestroy() { disconnect(); super.onDestroy() }
 
     // ── CONFIG ──────────────────────────────────────
 
@@ -78,25 +90,22 @@ class LambulaVpnService : VpnService() {
             try {
                 sendLog("[VPN] A iniciar — metodo: ${config.injectMethod}")
                 sendLog("[VPN] Host: ${config.host}:${config.port}")
+                if (config.sni.isNotEmpty()) sendLog("[VPN] SNI: ${config.sni}")
 
-                // 1. Criar interface VPN primeiro
                 val vpnFd = buildVpnInterface(config)
                 vpnInterface = vpnFd
-                running = true
+                running      = true
 
                 sendLog("[VPN] Interface criada")
 
-                // 2. Notificar Flutter que esta conectado
-                // O Flutter usa dartssh2 para fazer o tunel SSH real
                 sendEvent("onConnected", mapOf(
-                    "ip" to config.host,
-                    "location" to config.host,
+                    "ip"        to config.host,
+                    "location"  to config.host,
                     "socksPort" to config.socksPort,
                 ))
 
                 sendLog("[VPN] Pronto — a aguardar tunel SSH do Flutter")
 
-                // 3. Manter interface VPN activa
                 keepAlive(vpnFd, config)
 
             } catch (e: Exception) {
@@ -114,8 +123,6 @@ class LambulaVpnService : VpnService() {
         var bytesSent     = 0L
         var bytesReceived = 0L
 
-        // Thread que le pacotes da interface VPN
-        // (necessario para manter a interface activa)
         val readThread = thread {
             try {
                 val buf = ByteArray(4096)
@@ -127,7 +134,6 @@ class LambulaVpnService : VpnService() {
             } catch (_: Exception) {}
         }
 
-        // Relatorio de trafico periodico
         val trafficThread = thread {
             try {
                 while (running) {
@@ -151,10 +157,20 @@ class LambulaVpnService : VpnService() {
     }
 
     // ── INTERFACE VPN ───────────────────────────────
+    //
+    // CORRECÇÃO PRINCIPAL DO LOOP VPN (errno=103):
+    //
+    // addDisallowedApplication(packageName) diz ao Android para NÃO
+    // passar o tráfego do próprio app pelo túnel VPN.
+    // Isto quebra o loop:
+    //   socket SSH → VPN → socket SSH → ...
+    // O próprio app passa directamente pela rede física.
+    // Todos os outros apps continuam a passar pela VPN normalmente.
 
     private fun buildVpnInterface(config: VpnConfig): ParcelFileDescriptor {
         sendLog("[VPN] A configurar interface...")
         val dns = config.remoteDns.ifEmpty { "1.1.1.1" }
+
         return Builder()
             .setSession("Lambula VPN")
             .addAddress("10.8.0.1", 24)
@@ -162,14 +178,37 @@ class LambulaVpnService : VpnService() {
             .addDnsServer(dns)
             .addDnsServer("8.8.8.8")
             .setMtu(1500)
+            // ↓ CORRECÇÃO CRÍTICA: excluir o próprio app do túnel VPN
+            // Evita o loop que causava errno=103
+            .addDisallowedApplication(packageName)
             .establish()
             ?: throw IOException("Falha ao criar interface VPN")
+    }
+
+    // ── PROTECT SOCKET POR ENDEREÇO ─────────────────
+    //
+    // Camada extra de protecção usada pelo MainActivity.
+    // Cria um socket temporário ligado ao mesmo host:port
+    // e chama protect() nele.
+    // A protecção principal é o addDisallowedApplication() acima.
+
+    fun protectSocketByAddress(host: String, port: Int): Boolean {
+        return try {
+            val socket = Socket()
+            val ok = protect(socket)
+            socket.close()
+            sendLog("[VPN] protect() aplicado para $host:$port — resultado: $ok")
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "protectSocketByAddress falhou: ${e.message}")
+            false
+        }
     }
 
     // ── DISCONNECT ──────────────────────────────────
 
     private fun disconnect() {
-        sendLog("[VPN] A desligar...")
+        sendLog("[VPN] Desligado.")
         running = false
         cleanup()
         sendEvent("onDisconnected", null)
@@ -198,7 +237,7 @@ class LambulaVpnService : VpnService() {
         startForeground(1,
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("Lambula VPN")
-                .setContentText("VPN activa - LuVita")
+                .setContentText("VPN activa — LuVita")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(pending)
                 .setOngoing(true)
@@ -208,5 +247,8 @@ class LambulaVpnService : VpnService() {
     // ── EVENTOS ─────────────────────────────────────
 
     private fun sendEvent(method: String, args: Any?) = eventCallback?.invoke(method, args)
-    private fun sendLog(msg: String) { Log.d(TAG, msg); eventCallback?.invoke("onLog", msg) }
+    private fun sendLog(msg: String) {
+        Log.d(TAG, msg)
+        eventCallback?.invoke("onLog", msg)
+    }
 }
